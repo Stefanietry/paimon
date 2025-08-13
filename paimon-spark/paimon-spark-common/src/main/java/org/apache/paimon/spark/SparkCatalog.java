@@ -41,6 +41,7 @@ import org.apache.paimon.spark.utils.CatalogUtils;
 import org.apache.paimon.table.FormatTable;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.DataType;
+import org.apache.paimon.utils.ChainTableUtils;
 import org.apache.paimon.utils.ExceptionUtils;
 import org.apache.paimon.utils.TypeUtils;
 
@@ -647,8 +648,12 @@ public class SparkCatalog extends SparkBaseCatalog
                 return toSparkFormatTable(ident, (FormatTable) paimonTable);
             } else {
                 return new SparkTable(
-                        copyWithSQLConf(
-                                paimonTable, catalogName, toIdentifier(ident), extraOptions));
+                        ChainTableUtils.getReadTable(
+                                copyWithSQLConf(
+                                        paimonTable,
+                                        catalogName,
+                                        toIdentifier(ident),
+                                        extraOptions)));
             }
         } catch (Catalog.TableNotExistException e) {
             throw new NoSuchTableException(ident);
