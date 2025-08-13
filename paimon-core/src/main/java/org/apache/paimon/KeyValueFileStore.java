@@ -39,6 +39,7 @@ import org.apache.paimon.schema.SchemaManager;
 import org.apache.paimon.schema.TableSchema;
 import org.apache.paimon.table.BucketMode;
 import org.apache.paimon.table.CatalogEnvironment;
+import org.apache.paimon.table.source.ScanFactory;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.KeyComparatorSupplier;
 import org.apache.paimon.utils.UserDefinedSeqComparator;
@@ -113,7 +114,7 @@ public class KeyValueFileStore extends AbstractFileStore<KeyValue> {
 
     @Override
     public MergeFileSplitRead newRead() {
-        return new MergeFileSplitRead(
+        return ScanFactory.createMergeFileSplitRead(
                 options,
                 schema,
                 keyType,
@@ -124,14 +125,14 @@ public class KeyValueFileStore extends AbstractFileStore<KeyValue> {
     }
 
     public RawFileSplitRead newBatchRawFileRead() {
-        return new RawFileSplitRead(
+        return ScanFactory.createBatchRawFileRead(
                 fileIO,
                 schemaManager,
                 schema,
                 valueType,
                 FileFormatDiscover.of(options),
                 pathFactory(),
-                options.fileIndexReadEnabled(),
+                options,
                 false);
     }
 

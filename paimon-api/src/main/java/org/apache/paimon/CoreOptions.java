@@ -22,6 +22,7 @@ import org.apache.paimon.annotation.Documentation;
 import org.apache.paimon.annotation.Documentation.ExcludeFromDocumentation;
 import org.apache.paimon.annotation.Documentation.Immutable;
 import org.apache.paimon.annotation.VisibleForTesting;
+import org.apache.paimon.chain.ChainQueryType;
 import org.apache.paimon.compression.CompressOptions;
 import org.apache.paimon.fileindex.FileIndexOptions;
 import org.apache.paimon.fs.Path;
@@ -223,6 +224,41 @@ public class CoreOptions implements Serializable {
     @ExcludeFromDocumentation("Avoid using deprecated options")
     public static final ConfigOption<String> BRANCH =
             key("branch").stringType().defaultValue("main").withDescription("Specify branch name.");
+
+    @ExcludeFromDocumentation("Internal use only")
+    public static final ConfigOption<String> CHAIN_TABLE_ENABLED =
+            key("chain.table.enabled")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription("Specify chain table enable.");
+
+    @ExcludeFromDocumentation("Internal use only")
+    public static final ConfigOption<String> CHAIN_TABLE_SNAPSHOT_BRANCH =
+            key("chain.table.snapshot.branch")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription("Chain snapshot branch name.");
+
+    @ExcludeFromDocumentation("Internal use only")
+    public static final ConfigOption<String> CHAIN_TABLE_DELTA_BRANCH =
+            key("chain.table.delta.branch")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription("Chain delta branch name.");
+
+    @ExcludeFromDocumentation("Internal use only")
+    public static final ConfigOption<String> CHAIN_TABLE_QUERY_TYPE =
+            key("chain.table.query.type")
+                    .stringType()
+                    .defaultValue(ChainQueryType.DEFAULT.getValue())
+                    .withDescription("Chain query type.");
+
+    @ExcludeFromDocumentation("Internal use only")
+    public static final ConfigOption<String> CHAIN_TABLE_SINK_TYPE =
+            key("chain.table.sink.type")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription("Chain delta sink type.");
 
     public static final String FILE_FORMAT_ORC = "orc";
     public static final String FILE_FORMAT_AVRO = "avro";
@@ -1103,6 +1139,20 @@ public class CoreOptions implements Serializable {
                     .noDefaultValue()
                     .withDescription(
                             "Define partition by table options, cannot define partition on DDL and table options at the same time.");
+
+    @ExcludeFromDocumentation("Internal use only")
+    public static final ConfigOption<String> PARTITION_DATE_PATTERN =
+            key("partition.date.pattern")
+                    .stringType()
+                    .defaultValue("yyyyMMdd")
+                    .withDescription("The date pattern of partition");
+
+    @ExcludeFromDocumentation("Internal use only")
+    public static final ConfigOption<String> PARTITION_HOUR_PATTERN =
+            key("partition.hour.pattern")
+                    .stringType()
+                    .defaultValue("%02d")
+                    .withDescription("The hour pattern of partition");
 
     public static final ConfigOption<LookupLocalFileType> LOOKUP_LOCAL_FILE_TYPE =
             key("lookup.local-file-type")
@@ -1995,6 +2045,32 @@ public class CoreOptions implements Serializable {
         return BRANCH.defaultValue();
     }
 
+    public boolean isChainTable() {
+        return Boolean.parseBoolean(options.toMap().get(CHAIN_TABLE_ENABLED.key()));
+    }
+
+    public String chainSnapshotBranchName() {
+        return options.get(CHAIN_TABLE_SNAPSHOT_BRANCH);
+    }
+
+    public String chainDeltaBranchName() {
+        return options.get(CHAIN_TABLE_DELTA_BRANCH);
+    }
+
+    public boolean isChainBranch() {
+        String branch = branch();
+        return isChainTable()
+                && (branch.equalsIgnoreCase(chainDeltaBranchName())
+                        || branch.equalsIgnoreCase(chainSnapshotBranchName()));
+    }
+
+    public boolean isChainRead() {
+        return isChainBranch()
+                && ChainQueryType.CHAIN_READ
+                        .getValue()
+                        .equalsIgnoreCase(options.get(CHAIN_TABLE_QUERY_TYPE));
+    }
+
     public static Path path(Map<String, String> options) {
         return new Path(options.get(PATH.key()));
     }
@@ -2033,6 +2109,14 @@ public class CoreOptions implements Serializable {
 
     public String partitionDefaultName() {
         return options.get(PARTITION_DEFAULT_NAME);
+    }
+
+    public String partitionDatePattern() {
+        return options.get(PARTITION_DATE_PATTERN);
+    }
+
+    public String partitionHourPattern() {
+        return options.get(PARTITION_HOUR_PATTERN);
     }
 
     public boolean legacyPartitionName() {

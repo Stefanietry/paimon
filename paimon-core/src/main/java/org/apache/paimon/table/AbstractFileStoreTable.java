@@ -46,6 +46,7 @@ import org.apache.paimon.table.sink.TableCommitImpl;
 import org.apache.paimon.table.sink.WriteSelector;
 import org.apache.paimon.table.source.DataTableBatchScan;
 import org.apache.paimon.table.source.DataTableStreamScan;
+import org.apache.paimon.table.source.ScanFactory;
 import org.apache.paimon.table.source.SplitGenerator;
 import org.apache.paimon.table.source.StreamDataTableScan;
 import org.apache.paimon.table.source.snapshot.SnapshotReader;
@@ -266,7 +267,7 @@ abstract class AbstractFileStoreTable implements FileStoreTable {
 
     @Override
     public DataTableBatchScan newScan() {
-        return new DataTableBatchScan(
+        return ScanFactory.createBatchDataTableScan(
                 tableSchema,
                 schemaManager(),
                 coreOptions(),

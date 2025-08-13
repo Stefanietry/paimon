@@ -21,6 +21,7 @@ package org.apache.paimon.table;
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.catalog.CatalogContext;
 import org.apache.paimon.catalog.Identifier;
+import org.apache.paimon.chain.ChainQueryType;
 import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.options.Options;
@@ -98,7 +99,9 @@ public class FileStoreTableFactory {
 
         Options options = new Options(table.options());
         String fallbackBranch = options.get(CoreOptions.SCAN_FALLBACK_BRANCH);
-        if (!StringUtils.isNullOrWhitespaceOnly(fallbackBranch)) {
+        if (Boolean.parseBoolean(options.toMap().get(CoreOptions.CHAIN_TABLE_ENABLED.key()))) {
+            table = createChainTable(table, fileIO, tablePath, dynamicOptions, catalogEnvironment);
+        } else if (!StringUtils.isNullOrWhitespaceOnly(fallbackBranch)) {
             Options branchOptions = new Options(dynamicOptions.toMap());
             branchOptions.set(CoreOptions.BRANCH, fallbackBranch);
             Optional<TableSchema> schema =
@@ -128,6 +131,66 @@ public class FileStoreTableFactory {
         }
 
         return table;
+    }
+
+    public static FileStoreTable createChainTable(
+            FileStoreTable table,
+            FileIO fileIO,
+            Path tablePath,
+            Options dynamicOptions,
+            CatalogEnvironment catalogEnvironment) {
+        String snapshotBranch = table.options().get(CoreOptions.CHAIN_TABLE_SNAPSHOT_BRANCH.key());
+        String deltaBranch = table.options().get(CoreOptions.CHAIN_TABLE_DELTA_BRANCH.key());
+        if (snapshotBranch == null || deltaBranch == null) {
+            return table;
+        }
+        String selectBranch = catalogEnvironment.identifier().getBranchName();
+        boolean snapshotQuery = snapshotBranch.equalsIgnoreCase(selectBranch);
+        boolean incrementalQuery = deltaBranch.equalsIgnoreCase(selectBranch);
+
+        LOG.info(
+                "Create chain table, tbl path {}, snapshotBranch {}, deltaBranch{}, "
+                        + "selectBranch {} snapshotQuery{} incrementalQuery {}.",
+                tablePath,
+                snapshotBranch,
+                deltaBranch,
+                selectBranch,
+                snapshotQuery,
+                incrementalQuery);
+        if (incrementalQuery || snapshotQuery) {
+            return table;
+        }
+        Options snapshotBranchOptions = new Options(dynamicOptions.toMap());
+        snapshotBranchOptions.set(CoreOptions.BRANCH, snapshotBranch);
+        snapshotBranchOptions.set(
+                CoreOptions.CHAIN_TABLE_QUERY_TYPE, ChainQueryType.CHAIN_READ.getValue());
+        Optional<TableSchema> snapshotSchema =
+                new SchemaManager(fileIO, tablePath, snapshotBranch).latest();
+        FileStoreTable snapshotTable =
+                createWithoutFallbackBranch(
+                        fileIO,
+                        tablePath,
+                        snapshotSchema.get(),
+                        snapshotBranchOptions,
+                        catalogEnvironment);
+        Options deltaBranchOptions = new Options(dynamicOptions.toMap());
+        deltaBranchOptions.set(CoreOptions.BRANCH, deltaBranch);
+        deltaBranchOptions.set(
+                CoreOptions.CHAIN_TABLE_QUERY_TYPE, ChainQueryType.CHAIN_READ.getValue());
+        Optional<TableSchema> deltaSchema =
+                new SchemaManager(fileIO, tablePath, deltaBranch).latest();
+        FileStoreTable deltaTable =
+                createWithoutFallbackBranch(
+                        fileIO,
+                        tablePath,
+                        deltaSchema.get(),
+                        deltaBranchOptions,
+                        catalogEnvironment);
+        ChainFileStoreTable chainFileStoreTable =
+                new ChainFileStoreTable(
+                        (AbstractFileStoreTable) snapshotTable,
+                        (AbstractFileStoreTable) deltaTable);
+        return new FallbackReadFileStoreTable(table, chainFileStoreTable);
     }
 
     public static FileStoreTable createWithoutFallbackBranch(

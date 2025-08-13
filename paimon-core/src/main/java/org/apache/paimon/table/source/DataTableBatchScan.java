@@ -198,4 +198,8 @@ public class DataTableBatchScan extends AbstractDataTableScan {
         snapshotReader.withShard(indexOfThisSubtask, numberOfParallelSubtasks);
         return this;
     }
+
+    public void clear() {
+        hasNext = true;
+    }
 }

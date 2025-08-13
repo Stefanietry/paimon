@@ -26,8 +26,10 @@ import org.apache.paimon.fs.Path;
 import org.apache.paimon.index.IndexFileMeta;
 import org.apache.paimon.index.IndexInDataFileDirPathFactory;
 import org.apache.paimon.index.IndexPathFactory;
+import org.apache.paimon.io.ChainReadDataFilePathFactory;
 import org.apache.paimon.io.DataFilePathFactory;
 import org.apache.paimon.table.BucketMode;
+import org.apache.paimon.table.source.DataSplit;
 import org.apache.paimon.types.RowType;
 
 import javax.annotation.Nullable;
@@ -171,6 +173,34 @@ public class FileStorePathFactory {
                 fileSuffixIncludeCompression,
                 fileCompression,
                 createExternalPathProvider(partition, bucket));
+    }
+
+    public DataFilePathFactory createDataFilePathFactory(
+            BinaryRow partition, int bucket, Map<String, String> tblOptions, DataSplit split) {
+        if (TableUtils.isChainRead(tblOptions)) {
+            return createChainReadDataFilePathFactory(split);
+        }
+        return createDataFilePathFactory(partition, bucket);
+    }
+
+    public DataFilePathFactory createChainReadDataFilePathFactory(DataSplit split) {
+        return new ChainReadDataFilePathFactory(
+                root,
+                formatIdentifier,
+                dataFilePrefix,
+                changelogFilePrefix,
+                fileSuffixIncludeCompression,
+                fileCompression,
+                createExternalPathProvider(),
+                split.fileBucketPathMapping());
+    }
+
+    @Nullable
+    private ExternalPathProvider createExternalPathProvider() {
+        if (externalPaths == null || externalPaths.isEmpty()) {
+            return null;
+        }
+        return new ExternalPathProvider(externalPaths, null);
     }
 
     @Nullable

@@ -173,4 +173,184 @@ public class SparkCatalogWithHiveTest {
                         "org.apache.paimon.spark.extensions.PaimonSparkSessionExtensions")
                 .master("local[2]");
     }
+
+    @Test
+    public void testChainTable(@TempDir java.nio.file.Path tempDir) {
+        Path warehousePath = new Path("file:" + tempDir.toString());
+        SparkSession.Builder builder =
+                SparkSession.builder()
+                        .config("spark.sql.warehouse.dir", warehousePath.toString())
+                        // with hive metastore
+                        .config("spark.sql.catalogImplementation", "hive")
+                        .config("hive.metastore.uris", "thrift://localhost:" + PORT)
+                        .config("spark.sql.catalog.spark_catalog", SparkCatalog.class.getName())
+                        .config("spark.sql.catalog.spark_catalog.metastore", "hive")
+                        .config(
+                                "spark.sql.catalog.spark_catalog.hive.metastore.uris",
+                                "thrift://localhost:" + PORT)
+                        .config("spark.sql.catalog.spark_catalog.format-table.enabled", "true")
+                        .config(
+                                "spark.sql.catalog.spark_catalog.warehouse",
+                                warehousePath.toString())
+                        .config(
+                                "spark.sql.extensions",
+                                "org.apache.paimon.spark.extensions.PaimonSparkSessionExtensions")
+                        .master("local[2]");
+        SparkSession spark = builder.getOrCreate();
+        spark.sql("CREATE DATABASE IF NOT EXISTS my_db1");
+        spark.sql("USE spark_catalog.my_db1");
+
+        /** Create table */
+        spark.sql(
+                "CREATE TABLE IF NOT EXISTS \n"
+                        + "  `my_db1`.`chain_test` (\n"
+                        + "    `t1` BIGINT COMMENT 't1',\n"
+                        + "    `t2` BIGINT COMMENT 't2',\n"
+                        + "    `t3` STRING COMMENT 't3'\n"
+                        + "  ) PARTITIONED BY (`dt` STRING COMMENT 'dt') ROW FORMAT SERDE 'org.apache.paimon.hive.PaimonSerDe'\n"
+                        + "WITH\n"
+                        + "  SERDEPROPERTIES ('serialization.format' = '1') STORED AS INPUTFORMAT 'org.apache.paimon.hive.mapred.PaimonInputFormat' OUTPUTFORMAT 'org.apache.paimon.hive.mapred.PaimonOutputFormat' TBLPROPERTIES (\n"
+                        + "    'bucket-key' = 't1',\n"
+                        + "    'primary-key' = 'dt,t1',\n"
+                        + "    'partition.timestamp-pattern' = '$dt',\n"
+                        + "    'partition.timestamp-formatter' = 'yyyyMMdd',\n"
+                        + "    'chain.table.enabled' = 'true',\n"
+                        + "    'bucket' = '2',\n"
+                        + "    'merge-engine' = 'deduplicate', \n"
+                        + "    'sequence.field' = 't2'\n"
+                        + "  )");
+
+        /** Create branch */
+        spark.sql("CALL sys.create_branch('my_db1.chain_test', 'snapshot');");
+        spark.sql("CALL sys.create_branch('my_db1.chain_test', 'delta')");
+
+        /** Set branch */
+        spark.sql(
+                "ALTER TABLE my_db1.chain_test SET tblproperties ('chain.table.snapshot.branch' = 'snapshot')");
+        spark.sql(
+                "ALTER TABLE my_db1.chain_test SET tblproperties ('chain.table.delta.branch' = 'delta')");
+        spark.sql(
+                "ALTER TABLE `my_db1`.`chain_test$branch_snapshot` SET tblproperties ('chain.table.snapshot.branch' = 'snapshot')");
+        spark.sql(
+                "ALTER TABLE `my_db1`.`chain_test$branch_snapshot` SET tblproperties ('chain.table.delta.branch' = 'delta')");
+        spark.sql(
+                "ALTER TABLE `my_db1`.`chain_test$branch_delta` SET tblproperties ('chain.table.snapshot.branch' = 'snapshot')");
+        spark.sql(
+                "ALTER TABLE `my_db1`.`chain_test$branch_delta` SET tblproperties ('chain.table.delta.branch' = 'delta')");
+
+        spark.close();
+        spark = builder.getOrCreate();
+
+        /** Write main branch */
+        spark.sql(
+                "insert overwrite table  `my_db1`.`chain_test` partition (dt = '20250812') values (3, 1, '1'),(4, 1, '11');");
+
+        /** Write snapshot branch */
+        spark.sql("set spark.paimon.chain.table.sink.type=snapshot;");
+        spark.sql(
+                "insert overwrite table  `my_db1`.`chain_test`  partition (dt = '20250810')  values (1, 1, '1'),(11, 1, '11');");
+        spark.sql(
+                "insert overwrite table  `my_db1`.`chain_test` partition (dt = '20250812') values (3, 1, '1'),(4, 1, '1');");
+        spark.sql(
+                "insert overwrite table  `my_db1`.`chain_test` partition (dt = '20250813') values (5, 1, '1' ),(6, 1, '1');");
+
+        /** Write delta branch */
+        spark.sql("set spark.paimon.chain.table.sink.type=delta;");
+        spark.sql(
+                "insert overwrite table  `my_db1`.`chain_test` partition (dt = '20250810') values (1, 1, '1' ),(11, 1, '11' );");
+        spark.sql(
+                "insert overwrite table  `my_db1`.`chain_test` partition (dt = '20250811') values (1, 2, '1-1' ),(2, 1, '1' );");
+        spark.sql(
+                "insert overwrite table  `my_db1`.`chain_test` partition (dt = '20250812') values (3, 1, '1' ),(4, 1, '1' );");
+        spark.sql(
+                "insert overwrite table  `my_db1`.`chain_test` partition (dt = '20250813') values (5, 1, '1' ),(6, 1, '1' );");
+        spark.sql(
+                "insert overwrite table  `my_db1`.`chain_test` partition (dt = '20250814') values (5, 2, '1-1' ),(6, 2, '1-1' );");
+
+        /** Snapshot read */
+        assertThat(
+                        spark
+                                .sql(
+                                        "SELECT t1,t2,t3 FROM `my_db1`.`chain_test` where dt = '20250810'")
+                                .collectAsList().stream()
+                                .map(Row::toString)
+                                .collect(Collectors.toList()))
+                .containsExactlyInAnyOrder("[1,1,1]", "[11,1,11]");
+
+        /** Chain read */
+        assertThat(
+                        spark
+                                .sql(
+                                        "SELECT t1,t2,t3 FROM `my_db1`.`chain_test` where dt = '20250811'")
+                                .collectAsList().stream()
+                                .map(Row::toString)
+                                .collect(Collectors.toList()))
+                .containsExactlyInAnyOrder("[1,2,1-1]", "[2,1,1]", "[11,1,11]");
+
+        /** Non chain read */
+        assertThat(
+                        spark
+                                .sql(
+                                        "SELECT t1,t2,t3 FROM `my_db1`.`chain_test` where dt = '20250812'")
+                                .collectAsList().stream()
+                                .map(Row::toString)
+                                .collect(Collectors.toList()))
+                .containsExactlyInAnyOrder("[3,1,1]", "[4,1,11]");
+
+        /** Multi partition Read */
+        assertThat(
+                        spark
+                                .sql(
+                                        "SELECT t1,t2,t3 FROM `my_db1`.`chain_test` where dt in ('20250810', '20250811', '20250812');")
+                                .collectAsList().stream()
+                                .map(Row::toString)
+                                .collect(Collectors.toList()))
+                .containsExactlyInAnyOrder(
+                        "[1,1,1]",
+                        "[11,1,11]",
+                        "[1,2,1-1]",
+                        "[2,1,1]",
+                        "[11,1,11]",
+                        "[3,1,1]",
+                        "[4,1,11]");
+
+        /** Incremental read */
+        assertThat(
+                        spark
+                                .sql(
+                                        "SELECT t1,t2,t3 FROM `my_db1`.`chain_test$branch_delta` where dt = '20250811'")
+                                .collectAsList().stream()
+                                .map(Row::toString)
+                                .collect(Collectors.toList()))
+                .containsExactlyInAnyOrder("[1,2,1-1]", "[2,1,1]");
+
+        /** Multi partition incremental read */
+        assertThat(
+                        spark
+                                .sql(
+                                        "SELECT t1,t2,t3 FROM `my_db1`.`chain_test$branch_delta` where dt in ('20250810', '20250811', '20250812');")
+                                .collectAsList().stream()
+                                .map(Row::toString)
+                                .collect(Collectors.toList()))
+                .containsExactlyInAnyOrder(
+                        "[1,1,1]", "[11,1,11]", "[1,2,1-1]", "[2,1,1]", "[3,1,1]", "[4,1,1]");
+
+        /** Hybrid read */
+        assertThat(
+                        spark
+                                .sql(
+                                        "select t1,t2,t3 from  `my_db1`.`chain_test` where dt = '20250811'\n"
+                                                + "union all\n"
+                                                + "select t1,t2,t3 from  `my_db1`.`chain_test$branch_delta`  where dt = '20250811'")
+                                .collectAsList().stream()
+                                .map(Row::toString)
+                                .collect(Collectors.toList()))
+                .containsExactlyInAnyOrder(
+                        "[1,2,1-1]", "[2,1,1]", "[11,1,11]", "[1,2,1-1]", "[2,1,1]");
+
+        /** Drop table */
+        spark.sql("DROP TABLE IF EXISTS `my_db1`.`chain_test`;");
+
+        spark.close();
+    }
 }
