@@ -29,12 +29,14 @@ import org.apache.paimon.manifest.PartitionEntry;
 import org.apache.paimon.operation.BaseAppendFileStoreWrite;
 import org.apache.paimon.partition.PartitionPredicate;
 import org.apache.paimon.predicate.Predicate;
+import org.apache.paimon.spark.SparkTable;
 import org.apache.paimon.spark.SparkUtils;
 import org.apache.paimon.spark.catalyst.analysis.expressions.ExpressionUtils;
 import org.apache.paimon.spark.commands.PaimonSparkWriter;
 import org.apache.paimon.spark.sort.TableSorter;
 import org.apache.paimon.spark.util.ScanPlanHelper$;
 import org.apache.paimon.table.BucketMode;
+import org.apache.paimon.table.FallbackReadFileStoreTable;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.SpecialFields;
 import org.apache.paimon.table.sink.AppendCompactTaskSerializer;
@@ -53,6 +55,7 @@ import org.apache.paimon.utils.ParameterUtils;
 import org.apache.paimon.utils.ProcedureUtils;
 import org.apache.paimon.utils.SerializationUtils;
 import org.apache.paimon.utils.StringUtils;
+import org.apache.paimon.utils.TableUtils;
 import org.apache.paimon.utils.TimeUtils;
 
 import org.apache.spark.api.java.JavaRDD;
@@ -107,6 +110,8 @@ public class CompactProcedure extends BaseProcedure {
 
     private static final Logger LOG = LoggerFactory.getLogger(CompactProcedure.class);
 
+    private static final String PAIMON_CONF_PREFIX = "spark.paimon.";
+
     private static final ProcedureParameter[] PARAMETERS =
             new ProcedureParameter[] {
                 ProcedureParameter.required("table", StringType),
@@ -127,6 +132,7 @@ public class CompactProcedure extends BaseProcedure {
 
     private static final String MINOR = "minor";
     private static final String FULL = "full";
+    private static final String CHAIN_MERGE = "chain_merge";
 
     protected CompactProcedure(TableCatalog tableCatalog) {
         super(tableCatalog);
@@ -166,7 +172,9 @@ public class CompactProcedure extends BaseProcedure {
                     "sort compact do not support 'partition_idle_time'.");
         }
 
-        if (!(compactStrategy.equalsIgnoreCase(FULL) || compactStrategy.equalsIgnoreCase(MINOR))) {
+        if (!(compactStrategy.equalsIgnoreCase(FULL)
+                || compactStrategy.equalsIgnoreCase(MINOR)
+                || compactStrategy.equalsIgnoreCase(CHAIN_MERGE))) {
             throw new IllegalArgumentException(
                     String.format(
                             "The compact strategy only supports 'full' or 'minor', but '%s' is configured.",
@@ -177,6 +185,9 @@ public class CompactProcedure extends BaseProcedure {
                 partitions == null || where == null,
                 "partitions and where cannot be used together.");
         String finalWhere = partitions != null ? toWhere(partitions) : where;
+        if (compactStrategy.equalsIgnoreCase(CHAIN_MERGE)) {
+            return executeChainMerge(tableIdent, partitions);
+        }
         return modifyPaimonTable(
                 tableIdent,
                 table -> {
@@ -217,6 +228,59 @@ public class CompactProcedure extends BaseProcedure {
                                             partitionIdleTime));
                     return new InternalRow[] {internalRow};
                 });
+    }
+
+    private InternalRow[] executeChainMerge(Identifier tableIdent, String partitions) {
+        SparkTable sparkTable = loadSparkTable(tableIdent);
+        checkArgument(sparkTable.getTable() instanceof FallbackReadFileStoreTable);
+        FallbackReadFileStoreTable table = (FallbackReadFileStoreTable) sparkTable.getTable();
+        if (TableUtils.isChainTbl(table.schema().options()) && partitions != null) {
+            List<Map<String, String>> compactPartitions =
+                    ParameterUtils.getPartitions(partitions.split(";"));
+            if (compactPartitions.size() != 1
+                    || compactPartitions.get(0).size() != table.partitionKeys().size()) {
+                throw new IllegalArgumentException(
+                        String.format(
+                                "chain_merge compact strategy only supports one partition %s",
+                                partitions));
+            }
+            String toWhere = toWhere(partitions);
+            String toDest =
+                    compactPartitions.get(0).entrySet().stream()
+                            .map(entry -> entry.getKey() + "=" + entry.getValue())
+                            .reduce((s0, s1) -> s0 + " , " + s1)
+                            .get();
+            String dataCols =
+                    String.join(
+                            ",",
+                            table.schema().fieldNames().stream()
+                                    .filter(col -> !table.schema().partitionKeys().contains(col))
+                                    .collect(Collectors.toList()));
+            String snapshotBranch =
+                    String.format(
+                            "`%s`.`%s$%s`",
+                            sparkTable.table().fullName().split("\\.")[0],
+                            sparkTable.table().fullName().split("\\.")[1],
+                            org.apache.paimon.catalog.Identifier.SYSTEM_BRANCH_PREFIX
+                                    + table.schema()
+                                            .options()
+                                            .get(CoreOptions.CHAIN_TABLE_SNAPSHOT_BRANCH.key()));
+            String compactSql =
+                    String.format(
+                            "insert overwrite table %s partition (%s) select %s from %s where %s",
+                            snapshotBranch, toDest, dataCols, sparkTable.name(), toWhere);
+            String compactConf =
+                    String.format(
+                            "set %s%s=true;",
+                            PAIMON_CONF_PREFIX, CoreOptions.CHAIN_TABLE_MERGE_ENABLED.key());
+            LOG.info("Chain merge sql {}, mergeConf {}", compactSql, compactConf);
+            spark().sql(compactConf);
+            spark().sql(compactSql);
+            return new InternalRow[0];
+        } else {
+            throw new IllegalArgumentException(
+                    "chain_merge compact strategy only supports chain table.");
+        }
     }
 
     @Override

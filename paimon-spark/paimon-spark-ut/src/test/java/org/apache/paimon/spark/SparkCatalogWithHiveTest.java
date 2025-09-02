@@ -244,6 +244,8 @@ public class SparkCatalogWithHiveTest {
         /** Write main branch */
         spark.sql(
                 "insert overwrite table  `my_db1`.`chain_test` partition (dt = '20250812') values (3, 1, '1'),(4, 1, '11');");
+        spark.sql(
+                "insert overwrite table  `my_db1`.`chain_test`  partition (dt = '20250814') values (5, 101, '1-101');");
 
         /** Write snapshot branch */
         spark.sql("set spark.paimon.chain.table.sink.type=snapshot;");
@@ -347,6 +349,26 @@ public class SparkCatalogWithHiveTest {
                                 .collect(Collectors.toList()))
                 .containsExactlyInAnyOrder(
                         "[1,2,1-1]", "[2,1,1]", "[11,1,11]", "[1,2,1-1]", "[2,1,1]");
+
+        spark.close();
+        spark = builder.getOrCreate();
+
+        /** Chain merge */
+        spark.sql(
+                "CALL sys.compact(table => 'my_db1.chain_test', partitions => \"dt='20250814'\", compact_strategy => 'chain_merge');");
+
+        spark.close();
+        spark = builder.getOrCreate();
+
+        /** Snapshot read */
+        assertThat(
+                        spark
+                                .sql(
+                                        "SELECT t1,t2,t3 FROM `my_db1`.`chain_test$branch_snapshot` where dt = '20250814'")
+                                .collectAsList().stream()
+                                .map(Row::toString)
+                                .collect(Collectors.toList()))
+                .containsExactlyInAnyOrder("[5,2,1-1]", "[6,2,1-1]");
 
         /** Drop table */
         spark.sql("DROP TABLE IF EXISTS `my_db1`.`chain_test`;");

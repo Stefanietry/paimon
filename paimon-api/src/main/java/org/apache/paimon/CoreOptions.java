@@ -260,6 +260,13 @@ public class CoreOptions implements Serializable {
                     .noDefaultValue()
                     .withDescription("Chain delta sink type.");
 
+    @ExcludeFromDocumentation("Internal use only")
+    public static final ConfigOption<Boolean> CHAIN_TABLE_MERGE_ENABLED =
+            key("chain.table.merge.enabled")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription("Chain merge enable.");
+
     public static final String FILE_FORMAT_ORC = "orc";
     public static final String FILE_FORMAT_AVRO = "avro";
     public static final String FILE_FORMAT_PARQUET = "parquet";

@@ -21,11 +21,15 @@ package org.apache.paimon.utils;
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.chain.ChainQueryType;
 import org.apache.paimon.chain.ChainSinkType;
+import org.apache.paimon.table.ChainFileStoreTable;
 import org.apache.paimon.table.FallbackReadFileStoreTable;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.PrimaryKeyFileStoreTable;
+import org.apache.paimon.table.Table;
 
 import java.util.Map;
+
+import static org.apache.paimon.utils.Preconditions.checkArgument;
 
 /** Utils for table. */
 public class TableUtils {
@@ -71,6 +75,27 @@ public class TableUtils {
             return candidateFileStoreTable.switchToBranch(sinkBranch);
         } else {
             return fileStoreTable;
+        }
+    }
+
+    public static boolean isChainMergeEnable(Map<String, String> tableOptions) {
+        return isChainTbl(tableOptions)
+                && Boolean.parseBoolean(
+                        tableOptions.getOrDefault(
+                                CoreOptions.CHAIN_TABLE_MERGE_ENABLED.key(),
+                                String.valueOf(
+                                        CoreOptions.CHAIN_TABLE_MERGE_ENABLED.defaultValue())));
+    }
+
+    public static Table getReadTable(Table table) {
+        if (TableUtils.isChainMergeEnable(table.options()) && !isChainBranch(table.options())) {
+            checkArgument(
+                    table instanceof FallbackReadFileStoreTable
+                            && ((FallbackReadFileStoreTable) table).fallback()
+                                    instanceof ChainFileStoreTable);
+            return ((FallbackReadFileStoreTable) table).fallback();
+        } else {
+            return table;
         }
     }
 }
