@@ -20,9 +20,19 @@ package org.apache.paimon.table.source;
 
 import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.io.DataFileMeta;
+import org.apache.paimon.io.DataInputView;
+import org.apache.paimon.io.DataInputViewStreamWrapper;
+import org.apache.paimon.io.DataOutputView;
+import org.apache.paimon.io.DataOutputViewStreamWrapper;
+import org.apache.paimon.utils.SerializationUtils;
 
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.stream.Collectors;
 
@@ -33,17 +43,26 @@ public class ChainDataSplit extends DataSplit {
     public static final String VIRTUAL_BUCKET_PATH = "placeholder::virtual-bucket-path";
     private BinaryRow readPartition;
 
-    private final Map<String, String> fileBucketPathMapping;
+    private HashMap<String, String> fileBucketPathMapping;
 
     public ChainDataSplit(
             BinaryRow readPartition,
             int bucket,
             List<DataSplit> splits,
-            Map<String, String> fileBucketPathMapping) {
+            HashMap<String, String> fileBucketPathMapping) {
         this.readPartition = readPartition;
         this.fileBucketPathMapping = fileBucketPathMapping;
         DataSplit split =
                 splits.size() > 1 ? mergeSplits(readPartition, bucket, splits) : splits.get(0);
+        assign(split);
+    }
+
+    public ChainDataSplit(
+            DataSplit split,
+            BinaryRow readPartition,
+            HashMap<String, String> fileBucketPathMapping) {
+        this.readPartition = readPartition;
+        this.fileBucketPathMapping = fileBucketPathMapping;
         assign(split);
     }
 
@@ -126,7 +145,64 @@ public class ChainDataSplit extends DataSplit {
     }
 
     @Override
-    public Map<String, String> fileBucketPathMapping() {
+    public HashMap<String, String> fileBucketPathMapping() {
         return fileBucketPathMapping;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        boolean isSame = super.equals(o);
+        if (isSame) {
+            DataSplit chainDataSplit = (DataSplit) o;
+            return Objects.equals(readPartition, chainDataSplit.readPartition())
+                    && fileBucketPathMapping.equals(chainDataSplit.fileBucketPathMapping());
+        } else {
+            return false;
+        }
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(super.hashCode(), readPartition, fileBucketPathMapping);
+    }
+
+    private void writeObject(ObjectOutputStream out) throws IOException {
+        serialize(new DataOutputViewStreamWrapper(out));
+    }
+
+    private void readObject(ObjectInputStream in) throws IOException, ClassNotFoundException {
+        ChainDataSplit split = deserialize(new DataInputViewStreamWrapper(in));
+        this.readPartition = split.readPartition();
+        this.fileBucketPathMapping = split.fileBucketPathMapping();
+        assign(split);
+    }
+
+    @Override
+    public void serialize(DataOutputView out) throws IOException {
+        super.serialize(out);
+        SerializationUtils.serializeBinaryRow(readPartition, out);
+        out.writeInt(fileBucketPathMapping.size());
+        for (Map.Entry<String, String> entry : fileBucketPathMapping.entrySet()) {
+            out.writeUTF(entry.getKey());
+            out.writeUTF(entry.getValue());
+        }
+    }
+
+    public static ChainDataSplit deserialize(DataInputView in) throws IOException {
+        DataSplit dataSplit = DataSplit.deserialize(in);
+        BinaryRow readPartition = SerializationUtils.deserializeBinaryRow(in);
+        int size = in.readInt();
+        HashMap<String, String> fileBucketPathMapping = new HashMap<>();
+        for (int i = 0; i < size; i++) {
+            String key = in.readUTF();
+            String value = in.readUTF();
+            fileBucketPathMapping.put(key, value);
+        }
+        return new ChainDataSplit(dataSplit, readPartition, fileBucketPathMapping);
+    }
+
+    @Override
+    public String dataSplitType() {
+        return DataSplitType.CHAIN_DATA_SPLIT.name();
     }
 }

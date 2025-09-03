@@ -34,6 +34,7 @@ import org.apache.paimon.schema.TableSchema;
 import org.apache.paimon.table.source.snapshot.SnapshotReader;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.FileStorePathFactory;
+import org.apache.paimon.utils.TableUtils;
 
 import java.util.Comparator;
 
@@ -46,7 +47,7 @@ public class ScanFactory {
             CoreOptions options,
             SnapshotReader snapshotReader,
             TableQueryAuth queryAuth) {
-        if (options.isChainRead()) {
+        if (TableUtils.isChainBranchInternalReadMode(options.toMap())) {
             return new IdempotentReuseDataTableBatchScan(
                     schema, schemaManager, options, snapshotReader, queryAuth);
         }
@@ -70,7 +71,7 @@ public class ScanFactory {
                         keyComparator,
                         mfFactory,
                         readerFactoryBuilder);
-        if (options.isChainRead()) {
+        if (TableUtils.isChainBranchInternalReadMode(options.toMap())) {
             return new ChainMergeFileSplitRead(fileSplitRead);
         }
         return fileSplitRead;
@@ -95,7 +96,7 @@ public class ScanFactory {
                         fileStorePathFactory,
                         options.fileIndexReadEnabled(),
                         rowTrackingEnabled);
-        if (options.isChainRead()) {
+        if (TableUtils.isChainBranchInternalReadMode(options.toMap())) {
             return new ChainRawFileSplitRead(rawFileSplitRead);
         }
         return rawFileSplitRead;

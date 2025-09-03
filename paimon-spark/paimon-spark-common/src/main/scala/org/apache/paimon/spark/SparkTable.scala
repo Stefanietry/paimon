@@ -150,8 +150,8 @@ case class SparkTable(table: Table)
   override def newWriteBuilder(info: LogicalWriteInfo): WriteBuilder = {
     table match {
       case fileStoreTable: FileStoreTable =>
-        val writeTable = TableUtils.getWriteTable(fileStoreTable)
         val options = Options.fromMap(info.options)
+        val writeTable = TableUtils.getWriteTable(fileStoreTable)
         if (useV2Write) {
           new PaimonV2WriteBuilder(writeTable, info.schema())
         } else {

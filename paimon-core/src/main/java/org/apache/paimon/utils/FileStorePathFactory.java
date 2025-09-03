@@ -29,6 +29,7 @@ import org.apache.paimon.index.IndexPathFactory;
 import org.apache.paimon.io.ChainReadDataFilePathFactory;
 import org.apache.paimon.io.DataFilePathFactory;
 import org.apache.paimon.table.BucketMode;
+import org.apache.paimon.table.source.ChainDataSplit;
 import org.apache.paimon.table.source.DataSplit;
 import org.apache.paimon.types.RowType;
 
@@ -177,7 +178,8 @@ public class FileStorePathFactory {
 
     public DataFilePathFactory createDataFilePathFactory(
             BinaryRow partition, int bucket, Map<String, String> tblOptions, DataSplit split) {
-        if (TableUtils.isChainRead(tblOptions)) {
+        if (TableUtils.isChainBranchInternalReadMode(tblOptions)
+                && split instanceof ChainDataSplit) {
             return createChainReadDataFilePathFactory(split);
         }
         return createDataFilePathFactory(partition, bucket);

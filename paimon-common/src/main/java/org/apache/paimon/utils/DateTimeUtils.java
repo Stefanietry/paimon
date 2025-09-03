@@ -28,8 +28,6 @@ import java.time.LocalTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
-import java.time.format.DateTimeParseException;
-import java.time.temporal.ChronoUnit;
 import java.time.temporal.TemporalAccessor;
 import java.util.TimeZone;
 
@@ -716,23 +714,5 @@ public class DateTimeUtils {
     private static StringBuilder int2(StringBuilder buf, int i) {
         buf.append((char) ('0' + (i / 10) % 10));
         return buf.append((char) ('0' + i % 10));
-    }
-
-    public static String getNextDay(String dateStr, String pattern) {
-        if (dateStr == null || dateStr.trim().isEmpty()) {
-            throw new IllegalArgumentException(String.format("Date is empty %s", dateStr));
-        }
-        if (pattern == null || pattern.trim().isEmpty()) {
-            throw new IllegalArgumentException(String.format("Pattern is empty %s", pattern));
-        }
-        DateTimeFormatter formatter = DateTimeFormatter.ofPattern(pattern);
-        try {
-            LocalDate date = LocalDate.parse(dateStr, formatter);
-            LocalDate nextDay = date.plus(1, ChronoUnit.DAYS);
-            return nextDay.format(formatter);
-        } catch (DateTimeParseException e) {
-            throw new IllegalArgumentException(
-                    String.format("Incompatible date %s with pattern %s", dateStr, pattern), e);
-        }
     }
 }

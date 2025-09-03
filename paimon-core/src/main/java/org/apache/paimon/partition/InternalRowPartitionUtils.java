@@ -16,7 +16,7 @@
  * limitations under the License.
  */
 
-package org.apache.paimon.utils;
+package org.apache.paimon.partition;
 
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.codegen.RecordComparator;
@@ -24,9 +24,11 @@ import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.data.serializer.InternalRowSerializer;
 import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.InternalRowPartitionComputer;
+import org.apache.paimon.utils.ListUtils;
 
+import java.time.LocalDateTime;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -74,29 +76,38 @@ public class InternalRowPartitionUtils {
         List<String> startPartitionValues =
                 partitionComputer.generateOrderPartValues(beginPartition);
         List<String> endPartitionValues = partitionComputer.generateOrderPartValues(endPartition);
-        String startDate = startPartitionValues.get(0);
-        String endDate = endPartitionValues.get(0);
-        String candidateDate = startDate;
-        while (candidateDate.compareTo(endDate) <= 0) {
+        PartitionTimeExtractor timeExtractor =
+                new PartitionTimeExtractor(
+                        options.partitionTimestampPattern(), options.partitionTimestampFormatter());
+        PartitionValueGenerator valueGenerator =
+                new PartitionValueGenerator(
+                        options.partitionTimestampPattern(), options.partitionTimestampFormatter());
+        LocalDateTime stratPartitionTime =
+                timeExtractor.extract(partitionColumns, startPartitionValues);
+        LocalDateTime candidateTime = stratPartitionTime;
+        LocalDateTime endPartitionTime =
+                timeExtractor.extract(partitionColumns, endPartitionValues);
+        while (candidateTime.compareTo(endPartitionTime) <= 0) {
             if (isDailyPartition) {
-                if (candidateDate.compareTo(startDate) > 0) {
+                if (candidateTime.compareTo(stratPartitionTime) > 0) {
                     deltaPartitions.add(
                             serializer
                                     .toBinaryRow(
                                             InternalRowPartitionComputer.convertSpecToInternalRow(
                                                     ListUtils.convertListsToMap(
                                                             partitionColumns,
-                                                            Arrays.asList(candidateDate)),
+                                                            valueGenerator.generatePartitionValues(
+                                                                    candidateTime,
+                                                                    partitionColumns)),
                                                     partType,
                                                     options.partitionDefaultName()))
                                     .copy());
                 }
             } else {
                 for (int hour = 0; hour <= 23; hour++) {
+                    candidateTime = candidateTime.toLocalDate().atStartOfDay().plusHours(hour);
                     List<String> candidatePartitionValues =
-                            Arrays.asList(
-                                    candidateDate,
-                                    String.format(options.partitionDatePattern(), hour));
+                            valueGenerator.generatePartitionValues(candidateTime, partitionColumns);
                     BinaryRow candidatePartition =
                             serializer
                                     .toBinaryRow(
@@ -113,7 +124,7 @@ public class InternalRowPartitionUtils {
                     }
                 }
             }
-            candidateDate = DateTimeUtils.getNextDay(candidateDate, options.partitionDatePattern());
+            candidateTime = candidateTime.toLocalDate().plusDays(1).atStartOfDay();
         }
         return deltaPartitions;
     }

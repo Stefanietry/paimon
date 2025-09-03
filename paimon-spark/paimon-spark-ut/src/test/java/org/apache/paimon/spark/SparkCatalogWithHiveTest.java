@@ -214,7 +214,7 @@ public class SparkCatalogWithHiveTest {
                         + "    'primary-key' = 'dt,t1',\n"
                         + "    'partition.timestamp-pattern' = '$dt',\n"
                         + "    'partition.timestamp-formatter' = 'yyyyMMdd',\n"
-                        + "    'chain.table.enabled' = 'true',\n"
+                        + "    'chain-table.enabled' = 'true',\n"
                         + "    'bucket' = '2',\n"
                         + "    'merge-engine' = 'deduplicate', \n"
                         + "    'sequence.field' = 't2'\n"
@@ -226,17 +226,17 @@ public class SparkCatalogWithHiveTest {
 
         /** Set branch */
         spark.sql(
-                "ALTER TABLE my_db1.chain_test SET tblproperties ('chain.table.snapshot.branch' = 'snapshot')");
+                "ALTER TABLE my_db1.chain_test SET tblproperties ('scan.fallback-snapshot-branch' = 'snapshot')");
         spark.sql(
-                "ALTER TABLE my_db1.chain_test SET tblproperties ('chain.table.delta.branch' = 'delta')");
+                "ALTER TABLE my_db1.chain_test SET tblproperties ('scan.fallback-delta-branch' = 'delta')");
         spark.sql(
-                "ALTER TABLE `my_db1`.`chain_test$branch_snapshot` SET tblproperties ('chain.table.snapshot.branch' = 'snapshot')");
+                "ALTER TABLE `my_db1`.`chain_test$branch_snapshot` SET tblproperties ('scan.fallback-snapshot-branch' = 'snapshot')");
         spark.sql(
-                "ALTER TABLE `my_db1`.`chain_test$branch_snapshot` SET tblproperties ('chain.table.delta.branch' = 'delta')");
+                "ALTER TABLE `my_db1`.`chain_test$branch_snapshot` SET tblproperties ('scan.fallback-delta-branch' = 'delta')");
         spark.sql(
-                "ALTER TABLE `my_db1`.`chain_test$branch_delta` SET tblproperties ('chain.table.snapshot.branch' = 'snapshot')");
+                "ALTER TABLE `my_db1`.`chain_test$branch_delta` SET tblproperties ('scan.fallback-snapshot-branch' = 'snapshot')");
         spark.sql(
-                "ALTER TABLE `my_db1`.`chain_test$branch_delta` SET tblproperties ('chain.table.delta.branch' = 'delta')");
+                "ALTER TABLE `my_db1`.`chain_test$branch_delta` SET tblproperties ('scan.fallback-delta-branch' = 'delta')");
 
         spark.close();
         spark = builder.getOrCreate();
@@ -248,7 +248,7 @@ public class SparkCatalogWithHiveTest {
                 "insert overwrite table  `my_db1`.`chain_test`  partition (dt = '20250814') values (5, 101, '1-101');");
 
         /** Write snapshot branch */
-        spark.sql("set spark.paimon.chain.table.sink.type=snapshot;");
+        spark.sql("set spark.paimon.branch=snapshot;");
         spark.sql(
                 "insert overwrite table  `my_db1`.`chain_test`  partition (dt = '20250810')  values (1, 1, '1'),(11, 1, '11');");
         spark.sql(
@@ -257,7 +257,7 @@ public class SparkCatalogWithHiveTest {
                 "insert overwrite table  `my_db1`.`chain_test` partition (dt = '20250813') values (5, 1, '1' ),(6, 1, '1');");
 
         /** Write delta branch */
-        spark.sql("set spark.paimon.chain.table.sink.type=delta;");
+        spark.sql("set spark.paimon.branch=delta;");
         spark.sql(
                 "insert overwrite table  `my_db1`.`chain_test` partition (dt = '20250810') values (1, 1, '1' ),(11, 1, '11' );");
         spark.sql(
@@ -269,6 +269,8 @@ public class SparkCatalogWithHiveTest {
         spark.sql(
                 "insert overwrite table  `my_db1`.`chain_test` partition (dt = '20250814') values (5, 2, '1-1' ),(6, 2, '1-1' );");
 
+        spark.close();
+        spark = builder.getOrCreate();
         /** Snapshot read */
         assertThat(
                         spark
@@ -355,7 +357,7 @@ public class SparkCatalogWithHiveTest {
 
         /** Chain merge */
         spark.sql(
-                "CALL sys.compact(table => 'my_db1.chain_test', partitions => \"dt='20250814'\", compact_strategy => 'chain_merge');");
+                "CALL sys.compact(table => 'my_db1.chain_test', partitions => \"dt='20250814'\", compact_strategy => 'zipper_compact');");
 
         spark.close();
         spark = builder.getOrCreate();

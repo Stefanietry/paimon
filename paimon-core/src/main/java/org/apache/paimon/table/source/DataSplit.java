@@ -47,8 +47,8 @@ import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
@@ -94,12 +94,16 @@ public class DataSplit implements Split {
         return partition();
     }
 
-    public Map<String, String> fileBucketPathMapping() {
+    public HashMap<String, String> fileBucketPathMapping() {
         throw new UnsupportedOperationException("fileMappings is not supported");
     }
 
     public int bucket() {
         return bucket;
+    }
+
+    public String dataSplitType() {
+        return DataSplitType.DATA_SPLIT.name();
     }
 
     public String bucketPath() {

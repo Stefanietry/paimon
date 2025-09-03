@@ -16,27 +16,21 @@
  * limitations under the License.
  */
 
-package org.apache.paimon.chain;
+package org.apache.paimon;
 
 import org.apache.paimon.options.description.InlineElement;
 
-import java.util.Map;
-
-import static org.apache.paimon.CoreOptions.BRANCH;
-import static org.apache.paimon.CoreOptions.SCAN_FALLBACK_DELTA_BRANCH;
-import static org.apache.paimon.CoreOptions.SCAN_FALLBACK_SNAPSHOT_BRANCH;
 import static org.apache.paimon.options.description.TextElement.text;
 
-/** Type of the sink for chain table. */
-public enum ChainSinkType {
-    DEFAULT("", "main branch."),
-    DELTA("delta", "delta branch."),
-    SNAPSHOT("snapshot", "snapshot branch.");
+/** Type of the query for chain table. */
+public enum ChainQueryType {
+    DEFAULT("", "normal read."),
+    CHAIN_READ("chain_read", "chain read.");
 
     private final String value;
     private final String description;
 
-    ChainSinkType(String value, String description) {
+    ChainQueryType(String value, String description) {
         this.value = value;
         this.description = description;
     }
@@ -47,15 +41,5 @@ public enum ChainSinkType {
 
     public InlineElement getDescription() {
         return text(description);
-    }
-
-    public static String getSinkBranchName(String sinkType, Map<String, String> tblOptions) {
-        if (DELTA.value.equalsIgnoreCase(sinkType)) {
-            return tblOptions.get(SCAN_FALLBACK_DELTA_BRANCH.key());
-        } else if (SNAPSHOT.value.equalsIgnoreCase(sinkType)) {
-            return tblOptions.get(SCAN_FALLBACK_SNAPSHOT_BRANCH.key());
-        } else {
-            return tblOptions.getOrDefault(BRANCH.key(), BRANCH.defaultValue());
-        }
     }
 }

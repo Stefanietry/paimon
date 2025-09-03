@@ -18,9 +18,8 @@
 
 package org.apache.paimon.utils;
 
+import org.apache.paimon.ChainQueryType;
 import org.apache.paimon.CoreOptions;
-import org.apache.paimon.chain.ChainQueryType;
-import org.apache.paimon.chain.ChainSinkType;
 import org.apache.paimon.table.ChainFileStoreTable;
 import org.apache.paimon.table.FallbackReadFileStoreTable;
 import org.apache.paimon.table.FileStoreTable;
@@ -29,8 +28,6 @@ import org.apache.paimon.table.Table;
 
 import java.util.Map;
 
-import static org.apache.paimon.utils.Preconditions.checkArgument;
-
 /** Utils for table. */
 public class TableUtils {
 
@@ -38,64 +35,87 @@ public class TableUtils {
         return Boolean.parseBoolean(tableOptions.get(CoreOptions.CHAIN_TABLE_ENABLED.key()));
     }
 
-    public static boolean isChainBranch(Map<String, String> tableOptions) {
+    public static boolean isChainFallbackReadSnapshotBranch(Map<String, String> tableOptions) {
         String currentBranch =
                 tableOptions.getOrDefault(
                         CoreOptions.BRANCH.key(), CoreOptions.BRANCH.defaultValue());
         return isChainTbl(tableOptions)
-                && (currentBranch.equalsIgnoreCase(
-                                tableOptions.get(CoreOptions.CHAIN_TABLE_SNAPSHOT_BRANCH.key()))
-                        || currentBranch.equalsIgnoreCase(
-                                tableOptions.get(CoreOptions.CHAIN_TABLE_DELTA_BRANCH.key())));
+                && currentBranch.equalsIgnoreCase(
+                        tableOptions.get(CoreOptions.SCAN_FALLBACK_SNAPSHOT_BRANCH.key()));
     }
 
-    public static boolean isChainRead(Map<String, String> tableOptions) {
-        return isChainBranch(tableOptions)
+    public static boolean isChainFallbackReadDeltaBranch(Map<String, String> tableOptions) {
+        String currentBranch =
+                tableOptions.getOrDefault(
+                        CoreOptions.BRANCH.key(), CoreOptions.BRANCH.defaultValue());
+        return isChainTbl(tableOptions)
+                && currentBranch.equalsIgnoreCase(
+                        tableOptions.get(CoreOptions.SCAN_FALLBACK_DELTA_BRANCH.key()));
+    }
+
+    public static boolean isChainFallbackReadSnapshotBranch(
+            Map<String, String> tableOptions, String currentBranch) {
+        return isChainTbl(tableOptions)
+                && currentBranch.equalsIgnoreCase(
+                        tableOptions.get(CoreOptions.SCAN_FALLBACK_SNAPSHOT_BRANCH.key()));
+    }
+
+    public static boolean isChainFallbackReadDeltaBranch(
+            Map<String, String> tableOptions, String currentBranch) {
+        return isChainTbl(tableOptions)
+                && currentBranch.equalsIgnoreCase(
+                        tableOptions.get(CoreOptions.SCAN_FALLBACK_DELTA_BRANCH.key()));
+    }
+
+    public static boolean isChainFallbackReadBranch(Map<String, String> tableOptions) {
+        return isChainFallbackReadSnapshotBranch(tableOptions)
+                || isChainFallbackReadDeltaBranch(tableOptions);
+    }
+
+    public static boolean isChainFallbackReadBranch(
+            Map<String, String> tableOptions, String currentBranch) {
+        return isChainFallbackReadSnapshotBranch(tableOptions, currentBranch)
+                || isChainFallbackReadDeltaBranch(tableOptions, currentBranch);
+    }
+
+    public static boolean isChainBranchInternalReadMode(Map<String, String> tableOptions) {
+        return isChainFallbackReadBranch(tableOptions)
                 && ChainQueryType.CHAIN_READ
                         .getValue()
                         .equalsIgnoreCase(
                                 tableOptions.getOrDefault(
-                                        CoreOptions.CHAIN_TABLE_QUERY_TYPE.key(),
-                                        CoreOptions.CHAIN_TABLE_QUERY_TYPE.defaultValue()));
+                                        CoreOptions.CHAIN_TABLE_BRANCH_INTERNAL_USAGE_MODE.key(),
+                                        CoreOptions.CHAIN_TABLE_BRANCH_INTERNAL_USAGE_MODE
+                                                .defaultValue()));
     }
 
     public static FileStoreTable getWriteTable(FileStoreTable fileStoreTable) {
         if (TableUtils.isChainTbl(fileStoreTable.options())) {
-            String sinkType = fileStoreTable.options().get(CoreOptions.CHAIN_TABLE_SINK_TYPE.key());
-            String sinkBranch = ChainSinkType.getSinkBranchName(sinkType, fileStoreTable.options());
             FileStoreTable candidateFileStoreTable =
                     fileStoreTable instanceof FallbackReadFileStoreTable
                             ? ((FallbackReadFileStoreTable) fileStoreTable).primaryTable()
                             : fileStoreTable;
-            assert candidateFileStoreTable instanceof PrimaryKeyFileStoreTable;
-            if (sinkBranch.equalsIgnoreCase(
-                    ((PrimaryKeyFileStoreTable) candidateFileStoreTable).currentBranch())) {
-                return fileStoreTable;
-            }
-            return candidateFileStoreTable.switchToBranch(sinkBranch);
+            Preconditions.checkArgument(
+                    candidateFileStoreTable instanceof PrimaryKeyFileStoreTable,
+                    "Chain table must be primary key table.");
+            return candidateFileStoreTable;
         } else {
             return fileStoreTable;
         }
     }
 
-    public static boolean isChainMergeEnable(Map<String, String> tableOptions) {
-        return isChainTbl(tableOptions)
-                && Boolean.parseBoolean(
-                        tableOptions.getOrDefault(
-                                CoreOptions.CHAIN_TABLE_MERGE_ENABLED.key(),
-                                String.valueOf(
-                                        CoreOptions.CHAIN_TABLE_MERGE_ENABLED.defaultValue())));
-    }
-
     public static Table getReadTable(Table table) {
-        if (TableUtils.isChainMergeEnable(table.options()) && !isChainBranch(table.options())) {
-            checkArgument(
-                    table instanceof FallbackReadFileStoreTable
-                            && ((FallbackReadFileStoreTable) table).fallback()
-                                    instanceof ChainFileStoreTable);
-            return ((FallbackReadFileStoreTable) table).fallback();
-        } else {
-            return table;
+        if (isChainTbl(table.options()) && isChainFallbackReadBranch(table.options())) {
+            if (table instanceof FallbackReadFileStoreTable) {
+                if (isChainFallbackReadSnapshotBranch(table.options())) {
+                    return ((ChainFileStoreTable) (((FallbackReadFileStoreTable) table).fallback()))
+                            .primaryTable();
+                } else {
+                    return ((ChainFileStoreTable) (((FallbackReadFileStoreTable) table).fallback()))
+                            .fallback();
+                }
+            }
         }
+        return table;
     }
 }

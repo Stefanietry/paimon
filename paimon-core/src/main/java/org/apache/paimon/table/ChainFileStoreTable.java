@@ -26,6 +26,7 @@ import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.disk.IOManager;
 import org.apache.paimon.io.DataFileMeta;
 import org.apache.paimon.manifest.PartitionEntry;
+import org.apache.paimon.partition.InternalRowPartitionUtils;
 import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.schema.TableSchema;
@@ -38,7 +39,6 @@ import org.apache.paimon.table.source.Split;
 import org.apache.paimon.table.source.TableRead;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.InternalRowPartitionComputer;
-import org.apache.paimon.utils.InternalRowPartitionUtils;
 import org.apache.paimon.utils.RowDataToObjectArrayConverter;
 
 import org.slf4j.Logger;
@@ -176,7 +176,7 @@ public class ChainFileStoreTable extends FallbackReadFileStoreTable {
                 Map<BinaryRow, BinaryRow> partitionMapping =
                         InternalRowPartitionUtils.findFirstLatestPartitions(
                                 deltaPartitions, candidateSnapshotPartitions, partitionComparator);
-                Map<String, String> fileBucketPathMapping = new HashMap<>();
+                HashMap<String, String> fileBucketPathMapping = new HashMap<>();
                 for (Map.Entry<BinaryRow, BinaryRow> partitionParis : partitionMapping.entrySet()) {
                     List<BinaryRow> selectedDeltaPartitions =
                             InternalRowPartitionUtils.getDeltaPartitions(

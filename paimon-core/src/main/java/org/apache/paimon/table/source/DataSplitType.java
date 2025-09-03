@@ -16,30 +16,14 @@
  * limitations under the License.
  */
 
-package org.apache.paimon.chain;
+package org.apache.paimon.table.source;
 
-import org.apache.paimon.options.description.InlineElement;
+/** Type of the data split. */
+public enum DataSplitType {
+    DATA_SPLIT,
+    CHAIN_DATA_SPLIT;
 
-import static org.apache.paimon.options.description.TextElement.text;
-
-/** Type of the query for specified chain table branch. */
-public enum ChainQueryType {
-    DEFAULT("", "normal read."),
-    CHAIN_READ("chain_read", "chain read.");
-
-    private final String value;
-    private final String description;
-
-    ChainQueryType(String value, String description) {
-        this.value = value;
-        this.description = description;
-    }
-
-    public String getValue() {
-        return value;
-    }
-
-    public InlineElement getDescription() {
-        return text(description);
+    public static boolean isChainSplit(String dataSplitType) {
+        return DataSplitType.CHAIN_DATA_SPLIT.name().equalsIgnoreCase(dataSplitType);
     }
 }

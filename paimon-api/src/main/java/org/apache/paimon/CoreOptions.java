@@ -227,45 +227,36 @@ public class CoreOptions implements Serializable {
 
     @ExcludeFromDocumentation("Internal use only")
     public static final ConfigOption<String> CHAIN_TABLE_ENABLED =
-            key("chain.table.enabled")
+            key("chain-table.enabled")
                     .stringType()
                     .noDefaultValue()
                     .withDescription("Specify chain table enable.");
 
     @ExcludeFromDocumentation("Internal use only")
-    public static final ConfigOption<String> CHAIN_TABLE_SNAPSHOT_BRANCH =
-            key("chain.table.snapshot.branch")
+    public static final ConfigOption<String> SCAN_FALLBACK_SNAPSHOT_BRANCH =
+            key("scan.fallback-snapshot-branch")
                     .stringType()
                     .noDefaultValue()
-                    .withDescription("Chain snapshot branch name.");
+                    .withDescription(
+                            "When a batch job queries from a chain table, if a partition does not exist in the main branch, "
+                                    + "the reader will try to get this partition from chain snapshot branch.");
 
     @ExcludeFromDocumentation("Internal use only")
-    public static final ConfigOption<String> CHAIN_TABLE_DELTA_BRANCH =
-            key("chain.table.delta.branch")
+    public static final ConfigOption<String> SCAN_FALLBACK_DELTA_BRANCH =
+            key("scan.fallback-delta-branch")
                     .stringType()
                     .noDefaultValue()
-                    .withDescription("Chain delta branch name.");
+                    .withDescription(
+                            "When a batch job queries from a chain table, if a partition does not exist in the main "
+                                    + "and snapshot branch, the reader will try to get this partition from chain snapshot branch and delta "
+                                    + "branch together.");
 
     @ExcludeFromDocumentation("Internal use only")
-    public static final ConfigOption<String> CHAIN_TABLE_QUERY_TYPE =
-            key("chain.table.query.type")
+    public static final ConfigOption<String> CHAIN_TABLE_BRANCH_INTERNAL_USAGE_MODE =
+            key("chain-table.branch.internal.usage.mode")
                     .stringType()
                     .defaultValue(ChainQueryType.DEFAULT.getValue())
-                    .withDescription("Chain query type.");
-
-    @ExcludeFromDocumentation("Internal use only")
-    public static final ConfigOption<String> CHAIN_TABLE_SINK_TYPE =
-            key("chain.table.sink.type")
-                    .stringType()
-                    .noDefaultValue()
-                    .withDescription("Chain delta sink type.");
-
-    @ExcludeFromDocumentation("Internal use only")
-    public static final ConfigOption<Boolean> CHAIN_TABLE_MERGE_ENABLED =
-            key("chain.table.merge.enabled")
-                    .booleanType()
-                    .defaultValue(false)
-                    .withDescription("Chain merge enable.");
+                    .withDescription("Specify chain table branch internal usage mode.");
 
     public static final String FILE_FORMAT_ORC = "orc";
     public static final String FILE_FORMAT_AVRO = "avro";
@@ -1146,20 +1137,6 @@ public class CoreOptions implements Serializable {
                     .noDefaultValue()
                     .withDescription(
                             "Define partition by table options, cannot define partition on DDL and table options at the same time.");
-
-    @ExcludeFromDocumentation("Internal use only")
-    public static final ConfigOption<String> PARTITION_DATE_PATTERN =
-            key("partition.date.pattern")
-                    .stringType()
-                    .defaultValue("yyyyMMdd")
-                    .withDescription("The date pattern of partition");
-
-    @ExcludeFromDocumentation("Internal use only")
-    public static final ConfigOption<String> PARTITION_HOUR_PATTERN =
-            key("partition.hour.pattern")
-                    .stringType()
-                    .defaultValue("%02d")
-                    .withDescription("The hour pattern of partition");
 
     public static final ConfigOption<LookupLocalFileType> LOOKUP_LOCAL_FILE_TYPE =
             key("lookup.local-file-type")
@@ -2052,32 +2029,6 @@ public class CoreOptions implements Serializable {
         return BRANCH.defaultValue();
     }
 
-    public boolean isChainTable() {
-        return Boolean.parseBoolean(options.toMap().get(CHAIN_TABLE_ENABLED.key()));
-    }
-
-    public String chainSnapshotBranchName() {
-        return options.get(CHAIN_TABLE_SNAPSHOT_BRANCH);
-    }
-
-    public String chainDeltaBranchName() {
-        return options.get(CHAIN_TABLE_DELTA_BRANCH);
-    }
-
-    public boolean isChainBranch() {
-        String branch = branch();
-        return isChainTable()
-                && (branch.equalsIgnoreCase(chainDeltaBranchName())
-                        || branch.equalsIgnoreCase(chainSnapshotBranchName()));
-    }
-
-    public boolean isChainRead() {
-        return isChainBranch()
-                && ChainQueryType.CHAIN_READ
-                        .getValue()
-                        .equalsIgnoreCase(options.get(CHAIN_TABLE_QUERY_TYPE));
-    }
-
     public static Path path(Map<String, String> options) {
         return new Path(options.get(PATH.key()));
     }
@@ -2116,14 +2067,6 @@ public class CoreOptions implements Serializable {
 
     public String partitionDefaultName() {
         return options.get(PARTITION_DEFAULT_NAME);
-    }
-
-    public String partitionDatePattern() {
-        return options.get(PARTITION_DATE_PATTERN);
-    }
-
-    public String partitionHourPattern() {
-        return options.get(PARTITION_HOUR_PATTERN);
     }
 
     public boolean legacyPartitionName() {

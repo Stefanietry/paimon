@@ -132,7 +132,7 @@ public class CompactProcedure extends BaseProcedure {
 
     private static final String MINOR = "minor";
     private static final String FULL = "full";
-    private static final String CHAIN_MERGE = "chain_merge";
+    private static final String ZIPPER_COMPACT = "zipper_compact";
 
     protected CompactProcedure(TableCatalog tableCatalog) {
         super(tableCatalog);
@@ -174,7 +174,7 @@ public class CompactProcedure extends BaseProcedure {
 
         if (!(compactStrategy.equalsIgnoreCase(FULL)
                 || compactStrategy.equalsIgnoreCase(MINOR)
-                || compactStrategy.equalsIgnoreCase(CHAIN_MERGE))) {
+                || compactStrategy.equalsIgnoreCase(ZIPPER_COMPACT))) {
             throw new IllegalArgumentException(
                     String.format(
                             "The compact strategy only supports 'full' or 'minor', but '%s' is configured.",
@@ -185,7 +185,7 @@ public class CompactProcedure extends BaseProcedure {
                 partitions == null || where == null,
                 "partitions and where cannot be used together.");
         String finalWhere = partitions != null ? toWhere(partitions) : where;
-        if (compactStrategy.equalsIgnoreCase(CHAIN_MERGE)) {
+        if (compactStrategy.equalsIgnoreCase(ZIPPER_COMPACT)) {
             return executeChainMerge(tableIdent, partitions);
         }
         return modifyPaimonTable(
@@ -264,17 +264,12 @@ public class CompactProcedure extends BaseProcedure {
                             org.apache.paimon.catalog.Identifier.SYSTEM_BRANCH_PREFIX
                                     + table.schema()
                                             .options()
-                                            .get(CoreOptions.CHAIN_TABLE_SNAPSHOT_BRANCH.key()));
+                                            .get(CoreOptions.SCAN_FALLBACK_SNAPSHOT_BRANCH.key()));
             String compactSql =
                     String.format(
                             "insert overwrite table %s partition (%s) select %s from %s where %s",
                             snapshotBranch, toDest, dataCols, sparkTable.name(), toWhere);
-            String compactConf =
-                    String.format(
-                            "set %s%s=true;",
-                            PAIMON_CONF_PREFIX, CoreOptions.CHAIN_TABLE_MERGE_ENABLED.key());
-            LOG.info("Chain merge sql {}, mergeConf {}", compactSql, compactConf);
-            spark().sql(compactConf);
+            LOG.info("Chain merge sql {}, mergeConf {}", compactSql);
             spark().sql(compactSql);
             return new InternalRow[0];
         } else {
