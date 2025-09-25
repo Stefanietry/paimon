@@ -265,11 +265,16 @@ public class CompactProcedure extends BaseProcedure {
                                     + table.schema()
                                             .options()
                                             .get(CoreOptions.SCAN_FALLBACK_SNAPSHOT_BRANCH.key()));
+            String compactConf =
+                    String.format(
+                            "set %s%s=true;",
+                            PAIMON_CONF_PREFIX, CoreOptions.CHAIN_COMPACT_ENABLE.key());
             String compactSql =
                     String.format(
                             "insert overwrite table %s partition (%s) select %s from %s where %s",
                             snapshotBranch, toDest, dataCols, sparkTable.name(), toWhere);
-            LOG.info("Chain merge sql {}, mergeConf {}", compactSql);
+            LOG.info("Chain merge sql {}, conf {}", compactSql, compactConf);
+            spark().sql(compactConf);
             spark().sql(compactSql);
             return new InternalRow[0];
         } else {

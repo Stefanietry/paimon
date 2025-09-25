@@ -258,6 +258,13 @@ public class CoreOptions implements Serializable {
                     .defaultValue(ChainQueryType.DEFAULT.getValue())
                     .withDescription("Specify chain table branch internal usage mode.");
 
+    @ExcludeFromDocumentation("Internal use only")
+    public static final ConfigOption<Boolean> CHAIN_COMPACT_ENABLE =
+            key("chain.compact.enabled")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription("Enable compact for chain table.");
+
     public static final String FILE_FORMAT_ORC = "orc";
     public static final String FILE_FORMAT_AVRO = "avro";
     public static final String FILE_FORMAT_PARQUET = "parquet";

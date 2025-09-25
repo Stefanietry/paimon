@@ -105,17 +105,33 @@ public class TableUtils {
     }
 
     public static Table getReadTable(Table table) {
-        if (isChainTbl(table.options()) && isChainFallbackReadBranch(table.options())) {
-            if (table instanceof FallbackReadFileStoreTable) {
-                if (isChainFallbackReadSnapshotBranch(table.options())) {
-                    return ((ChainFileStoreTable) (((FallbackReadFileStoreTable) table).fallback()))
-                            .primaryTable();
-                } else {
-                    return ((ChainFileStoreTable) (((FallbackReadFileStoreTable) table).fallback()))
-                            .fallback();
+        if (isChainTbl(table.options())) {
+            if (isChainFallbackReadBranch(table.options())) {
+                if (table instanceof FallbackReadFileStoreTable) {
+                    if (isChainFallbackReadSnapshotBranch(table.options())) {
+                        return ((ChainFileStoreTable)
+                                        (((FallbackReadFileStoreTable) table).fallback()))
+                                .primaryTable();
+                    } else {
+                        return ((ChainFileStoreTable)
+                                        (((FallbackReadFileStoreTable) table).fallback()))
+                                .fallback();
+                    }
                 }
+                return table;
+            }
+            if (isChainCompactEnable(table.options())) {
+                return ((FallbackReadFileStoreTable) table).fallback();
             }
         }
         return table;
+    }
+
+    public static boolean isChainCompactEnable(Map<String, String> tableOptions) {
+        return isChainTbl(tableOptions)
+                && Boolean.parseBoolean(
+                        tableOptions.getOrDefault(
+                                CoreOptions.CHAIN_COMPACT_ENABLE.key(),
+                                String.valueOf(CoreOptions.CHAIN_COMPACT_ENABLE.defaultValue())));
     }
 }
