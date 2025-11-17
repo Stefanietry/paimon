@@ -106,26 +106,6 @@ public class RawFileSplitRead implements SplitRead<InternalRow> {
         this.readRowType = rowType;
     }
 
-    public RawFileSplitRead(RawFileSplitRead rawFileSplitRead) {
-        this.fileIO = rawFileSplitRead.fileIO;
-        this.schemaManager = rawFileSplitRead.schemaManager;
-        this.schema = rawFileSplitRead.schema;
-        this.formatDiscover = rawFileSplitRead.formatDiscover;
-        this.pathFactory = rawFileSplitRead.pathFactory;
-        this.formatReaderMappings = rawFileSplitRead.formatReaderMappings;
-        this.fileIndexReadEnabled = rawFileSplitRead.fileIndexReadEnabled;
-        this.readRowType = rawFileSplitRead.readRowType;
-        this.rowTrackingEnabled = rawFileSplitRead.rowTrackingEnabled;
-    }
-
-    public SchemaManager schemaManager() {
-        return schemaManager;
-    }
-
-    public TableSchema schema() {
-        return schema;
-    }
-
     @Override
     public SplitRead<InternalRow> forceKeepDelete() {
         return this;
@@ -173,8 +153,15 @@ public class RawFileSplitRead implements SplitRead<InternalRow> {
         if (!split.beforeFiles().isEmpty()) {
             LOG.info("Ignore split before files: {}", split.beforeFiles());
         }
-        return createReader(
-                split.partition(), split.bucket(), split.dataFiles(), createDvFactories(split));
+
+        List<DataFileMeta> files = split.dataFiles();
+        DeletionVector.Factory dvFactory =
+                DeletionVector.factory(fileIO, files, split.deletionFiles().orElse(null));
+        Map<String, IOExceptionSupplier<DeletionVector>> dvFactories = new HashMap<>();
+        for (DataFileMeta file : files) {
+            dvFactories.put(file.fileName(), () -> dvFactory.create(file.fileName()).orElse(null));
+        }
+        return createReader(split.partition(), split.bucket(), split.dataFiles(), dvFactories);
     }
 
     public RecordReader<InternalRow> createReader(
@@ -183,19 +170,8 @@ public class RawFileSplitRead implements SplitRead<InternalRow> {
             List<DataFileMeta> files,
             @Nullable Map<String, IOExceptionSupplier<DeletionVector>> dvFactories)
             throws IOException {
-        return createReader(partition, bucket, files, dvFactories, null);
-    }
-
-    public RecordReader<InternalRow> createReader(
-            BinaryRow partition,
-            int bucket,
-            List<DataFileMeta> files,
-            @Nullable Map<String, IOExceptionSupplier<DeletionVector>> dvFactories,
-            @Nullable DataSplit dataSplit)
-            throws IOException {
         DataFilePathFactory dataFilePathFactory =
-                pathFactory.createDataFilePathFactory(
-                        partition, bucket, schema.options(), dataSplit);
+                pathFactory.createDataFilePathFactory(partition, bucket);
         List<ReaderSupplier<InternalRow>> suppliers = new ArrayList<>();
 
         Builder formatReaderMappingBuilder =
@@ -216,12 +192,11 @@ public class RawFileSplitRead implements SplitRead<InternalRow> {
         for (DataFileMeta file : files) {
             suppliers.add(
                     createFileReader(
-                            getReadPartition(partition, dataSplit),
+                            partition,
                             dataFilePathFactory,
                             file,
                             formatReaderMappingBuilder,
-                            dvFactories,
-                            dataSplit));
+                            dvFactories));
         }
 
         return ConcatRecordReader.create(suppliers);
@@ -232,49 +207,26 @@ public class RawFileSplitRead implements SplitRead<InternalRow> {
             DataFilePathFactory dataFilePathFactory,
             DataFileMeta file,
             Builder formatBuilder,
-            @Nullable Map<String, IOExceptionSupplier<DeletionVector>> dvFactories,
-            @Nullable DataSplit dataSplit) {
+            @Nullable Map<String, IOExceptionSupplier<DeletionVector>> dvFactories) {
         String formatIdentifier = DataFilePathFactory.formatIdentifier(file.fileName());
+        long schemaId = file.schemaId();
 
         FormatReaderMapping formatReaderMapping =
                 formatReaderMappings.computeIfAbsent(
                         new FormatKey(file.schemaId(), formatIdentifier),
                         key ->
                                 formatBuilder.build(
-                                        formatIdentifier, schema, getDataSchema(dataSplit, file)));
+                                        formatIdentifier,
+                                        schema,
+                                        schemaId == schema.id()
+                                                ? schema
+                                                : schemaManager.schema(schemaId)));
 
         IOExceptionSupplier<DeletionVector> dvFactory =
                 dvFactories == null ? null : dvFactories.get(file.fileName());
         return () ->
                 createFileReader(
                         partition, file, dataFilePathFactory, formatReaderMapping, dvFactory);
-    }
-
-    protected BinaryRow getReadPartition(BinaryRow partition, DataSplit dataSplit) {
-        return partition;
-    }
-
-    protected SchemaManager getSchemaManager(DataSplit dataSplit, String fileName) {
-        return schemaManager;
-    }
-
-    public TableSchema getDataSchema(DataSplit dataSplit, DataFileMeta fileMeta) {
-        long schemaId = fileMeta.schemaId();
-        if (schemaId == schema.id()) {
-            return schema;
-        }
-        return getSchemaManager(dataSplit, fileMeta.fileName()).schema(schemaId);
-    }
-
-    protected Map<String, IOExceptionSupplier<DeletionVector>> createDvFactories(DataSplit split) {
-        List<DataFileMeta> files = split.dataFiles();
-        DeletionVector.Factory dvFactory =
-                DeletionVector.factory(fileIO, files, split.deletionFiles().orElse(null));
-        Map<String, IOExceptionSupplier<DeletionVector>> dvFactories = new HashMap<>();
-        for (DataFileMeta file : files) {
-            dvFactories.put(file.fileName(), () -> dvFactory.create(file.fileName()).orElse(null));
-        }
-        return dvFactories;
     }
 
     private FileRecordReader<InternalRow> createFileReader(

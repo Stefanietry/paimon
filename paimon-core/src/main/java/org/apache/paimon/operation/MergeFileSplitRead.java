@@ -28,6 +28,7 @@ import org.apache.paimon.disk.IOManager;
 import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.io.DataFileMeta;
 import org.apache.paimon.io.KeyValueFileReaderFactory;
+import org.apache.paimon.io.ReadContext;
 import org.apache.paimon.mergetree.DropDeleteReader;
 import org.apache.paimon.mergetree.MergeSorter;
 import org.apache.paimon.mergetree.MergeTreeReaders;
@@ -44,10 +45,13 @@ import org.apache.paimon.reader.ReaderSupplier;
 import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.schema.TableSchema;
 import org.apache.paimon.table.BucketMode;
+import org.apache.paimon.table.source.CompoundDataSplit;
 import org.apache.paimon.table.source.DataSplit;
 import org.apache.paimon.table.source.DeletionFile;
+import org.apache.paimon.table.source.Split;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.Preconditions;
 import org.apache.paimon.utils.ProjectedRow;
 import org.apache.paimon.utils.Projection;
 import org.apache.paimon.utils.UserDefinedSeqComparator;
@@ -111,21 +115,6 @@ public class MergeFileSplitRead implements SplitRead<KeyValue> {
                         CoreOptions.fromMap(tableSchema.options()), keyType, valueType, null);
         this.sequenceFields = options.sequenceField();
         this.sequenceOrder = options.sequenceFieldSortOrderIsAscending();
-    }
-
-    public MergeFileSplitRead(MergeFileSplitRead splitRead) {
-        this.tableSchema = splitRead.tableSchema;
-        this.readerFactoryBuilder = splitRead.readerFactoryBuilder;
-        this.fileIO = splitRead.fileIO;
-        this.keyComparator = splitRead.keyComparator;
-        this.mfFactory = splitRead.mfFactory;
-        this.mergeSorter = splitRead.mergeSorter;
-        this.sequenceFields = splitRead.sequenceFields;
-        this.sequenceOrder = splitRead.sequenceOrder;
-    }
-
-    public boolean isForceKeepDelete() {
-        return forceKeepDelete;
     }
 
     public Comparator<InternalRow> keyComparator() {
@@ -289,24 +278,13 @@ public class MergeFileSplitRead implements SplitRead<KeyValue> {
             @Nullable List<DeletionFile> deletionFiles,
             boolean keepDelete)
             throws IOException {
-        return createMergeReader(partition, bucket, files, deletionFiles, keepDelete, null);
-    }
-
-    public RecordReader<KeyValue> createMergeReader(
-            BinaryRow partition,
-            int bucket,
-            List<DataFileMeta> files,
-            @Nullable List<DeletionFile> deletionFiles,
-            boolean keepDelete,
-            DataSplit split)
-            throws IOException {
         // Sections are read by SortMergeReader, which sorts and merges records by keys.
         // So we cannot project keys or else the sorting will be incorrect.
         DeletionVector.Factory dvFactory = DeletionVector.factory(fileIO, files, deletionFiles);
         KeyValueFileReaderFactory overlappedSectionFactory =
-                getOverlappedSectionFactory(split, partition, bucket, dvFactory);
+                readerFactoryBuilder.build(partition, bucket, dvFactory, false, filtersForKeys);
         KeyValueFileReaderFactory nonOverlappedSectionFactory =
-                getNonOverlappedSectionFactory(split, partition, bucket, dvFactory);
+                readerFactoryBuilder.build(partition, bucket, dvFactory, false, filtersForAll);
 
         List<ReaderSupplier<KeyValue>> sectionReaders = new ArrayList<>();
         MergeFunctionWrapper<KeyValue> mergeFuncWrapper =
@@ -333,18 +311,6 @@ public class MergeFileSplitRead implements SplitRead<KeyValue> {
         return projectOuter(projectKey(reader));
     }
 
-    protected KeyValueFileReaderFactory getOverlappedSectionFactory(
-            DataSplit split, BinaryRow partition, int bucket, DeletionVector.Factory dvFactory) {
-        return readerFactoryBuilder.build(
-                partition, bucket, dvFactory, false, filtersForKeys, split);
-    }
-
-    protected KeyValueFileReaderFactory getNonOverlappedSectionFactory(
-            DataSplit split, BinaryRow partition, int bucket, DeletionVector.Factory dvFactory) {
-        return readerFactoryBuilder.build(
-                partition, bucket, dvFactory, false, filtersForAll, split);
-    }
-
     public RecordReader<KeyValue> createNoMergeReader(
             BinaryRow partition,
             int bucket,
@@ -365,6 +331,48 @@ public class MergeFileSplitRead implements SplitRead<KeyValue> {
         }
 
         return projectOuter(ConcatRecordReader.create(suppliers));
+    }
+
+    @Override
+    public RecordReader<KeyValue> createRecordReader(Split split) throws IOException {
+        Preconditions.checkArgument(
+                split instanceof CompoundDataSplit, "split must be CompoundDataSplit");
+        CompoundDataSplit dataSplit = (CompoundDataSplit) split;
+        BinaryRow readPartition = dataSplit.readPartition();
+        List<DataFileMeta> files = dataSplit.dataFiles();
+        ReadContext readContext =
+                new ReadContext.Builder()
+                        .withReadPartition(readPartition)
+                        .withFileBranchPathMapping(dataSplit.fileBranchMapping())
+                        .withFileBucketPathMapping(dataSplit.fileBucketPathMapping())
+                        .build();
+        DeletionVector.Factory dvFactory =
+                DeletionVector.factory(fileIO, files, split.deletionFiles().orElse(null));
+        CompoundKeyValueFileReaderFactory overlappedSectionFactory =
+                readerFactoryBuilder.build(dvFactory, false, filtersForKeys, readContext);
+        CompoundKeyValueFileReaderFactory nonOverlappedSectionFactory =
+                readerFactoryBuilder.build(dvFactory, false, filtersForAll, readContext);
+        List<ReaderSupplier<KeyValue>> sectionReaders = new ArrayList<>();
+        MergeFunctionWrapper<KeyValue> mergeFuncWrapper =
+                new ReducerMergeFunctionWrapper(mfFactory.create(pushdownProjection));
+        for (List<SortedRun> section : new IntervalPartition(files, keyComparator).partition()) {
+            sectionReaders.add(
+                    () ->
+                            MergeTreeReaders.readerForSection(
+                                    section,
+                                    section.size() > 1
+                                            ? overlappedSectionFactory
+                                            : nonOverlappedSectionFactory,
+                                    keyComparator,
+                                    createUdsComparator(),
+                                    mergeFuncWrapper,
+                                    mergeSorter));
+        }
+        RecordReader<KeyValue> reader = ConcatRecordReader.create(sectionReaders);
+        if (!forceKeepDelete) {
+            reader = new DropDeleteReader(reader);
+        }
+        return projectOuter(projectKey(reader));
     }
 
     private RecordReader<KeyValue> projectKey(RecordReader<KeyValue> reader) {

@@ -19,35 +19,60 @@
 package org.apache.paimon.operation;
 
 import org.apache.paimon.data.BinaryRow;
-import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.deletionvectors.DeletionVector;
+import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.io.DataFileMeta;
-import org.apache.paimon.reader.RecordReader;
+import org.apache.paimon.io.DataFilePathFactory;
+import org.apache.paimon.io.KeyValueFileReaderFactory;
+import org.apache.paimon.io.ReadContext;
 import org.apache.paimon.schema.SchemaManager;
 import org.apache.paimon.schema.TableSchema;
-import org.apache.paimon.table.source.DataSplit;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import java.io.IOException;
+import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.FormatReaderMapping;
 
 import static org.apache.paimon.CoreOptions.BRANCH;
 import static org.apache.paimon.CoreOptions.SCAN_FALLBACK_DELTA_BRANCH;
 import static org.apache.paimon.CoreOptions.SCAN_FALLBACK_SNAPSHOT_BRANCH;
 
-/** A specified {@link RawFileSplitRead} for chain table. */
-public class ChainRawFileSplitRead extends RawFileSplitRead {
+/** A specific implementation about {@link KeyValueFileReaderFactory} for chain table. */
+public class CompoundKeyValueFileReaderFactory extends KeyValueFileReaderFactory {
 
-    private static final Logger LOG = LoggerFactory.getLogger(ChainRawFileSplitRead.class);
+    private final SchemaManager snapshotSchemaManager;
+
+    private final SchemaManager deltaSchemaManager;
 
     private final String snapshotBranch;
+
     private final String deltaBranch;
-    private final SchemaManager snapshotSchemaManager;
-    private final SchemaManager deltaSchemaManager;
+
     private final String currentBranch;
 
-    public ChainRawFileSplitRead(RawFileSplitRead rawFileSplitRead) {
-        super(rawFileSplitRead);
+    private final ReadContext readContext;
+
+    public CompoundKeyValueFileReaderFactory(
+            FileIO fileIO,
+            SchemaManager schemaManager,
+            TableSchema schema,
+            RowType keyType,
+            RowType valueType,
+            FormatReaderMapping.Builder formatReaderMappingBuilder,
+            DataFilePathFactory pathFactory,
+            long asyncThreshold,
+            BinaryRow partition,
+            DeletionVector.Factory dvFactory,
+            ReadContext readContext) {
+        super(
+                fileIO,
+                schemaManager,
+                schema,
+                keyType,
+                valueType,
+                formatReaderMappingBuilder,
+                pathFactory,
+                asyncThreshold,
+                partition,
+                dvFactory);
+        this.readContext = readContext;
         this.currentBranch = super.schema().options().get(BRANCH.key());
         this.snapshotBranch = super.schema().options().get(SCAN_FALLBACK_SNAPSHOT_BRANCH.key());
         this.deltaBranch = super.schema().options().get(SCAN_FALLBACK_DELTA_BRANCH.key());
@@ -61,27 +86,8 @@ public class ChainRawFileSplitRead extends RawFileSplitRead {
                         : super.schemaManager().copyWithBranch(deltaBranch);
     }
 
-    @Override
-    public RecordReader<InternalRow> createReader(DataSplit split) throws IOException {
-        if (!split.beforeFiles().isEmpty()) {
-            LOG.info("Ignore split before files: {}", split.beforeFiles());
-        }
-        return createReader(
-                split.partition(),
-                split.bucket(),
-                split.dataFiles(),
-                createDvFactories(split),
-                split);
-    }
-
-    @Override
-    protected BinaryRow getReadPartition(BinaryRow partition, DataSplit dataSplit) {
-        return dataSplit.readPartition();
-    }
-
-    @Override
-    protected SchemaManager getSchemaManager(DataSplit dataSplit, String fileName) {
-        if (snapshotBranch.equalsIgnoreCase(dataSplit.fileBranchMapping().get(fileName))) {
+    public SchemaManager getSchemaManager(String fileName) {
+        if (snapshotBranch.equalsIgnoreCase(readContext.fileBranchMapping().get(fileName))) {
             return snapshotSchemaManager;
         } else {
             return deltaSchemaManager;
@@ -89,11 +95,16 @@ public class ChainRawFileSplitRead extends RawFileSplitRead {
     }
 
     @Override
-    public TableSchema getDataSchema(DataSplit dataSplit, DataFileMeta fileMeta) {
+    protected TableSchema getDataSchema(DataFileMeta fileMeta) {
         if (currentBranch.equalsIgnoreCase(
-                dataSplit.fileBranchMapping().get(fileMeta.fileName()))) {
-            super.getDataSchema(dataSplit, fileMeta);
+                readContext.fileBranchMapping().get(fileMeta.fileName()))) {
+            return super.getDataSchema(fileMeta);
         }
-        return getSchemaManager(dataSplit, fileMeta.fileName()).schema(fileMeta.schemaId());
+        return getSchemaManager(fileMeta.fileName()).schema(fileMeta.schemaId());
+    }
+
+    @Override
+    protected BinaryRow getReadPartition() {
+        return readContext.readPartition();
     }
 }

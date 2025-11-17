@@ -34,6 +34,7 @@ import org.apache.paimon.table.source.splitread.IncrementalDiffReadProvider;
 import org.apache.paimon.table.source.splitread.MergeFileSplitReadProvider;
 import org.apache.paimon.table.source.splitread.PrimaryKeyTableRawFileSplitReadProvider;
 import org.apache.paimon.table.source.splitread.SplitReadProvider;
+import org.apache.paimon.table.source.splitread.SplitReadProvider.Context;
 import org.apache.paimon.types.RowType;
 
 import javax.annotation.Nullable;
@@ -146,13 +147,21 @@ public final class KeyValueTableRead extends AbstractDataTableRead {
 
     @Override
     public RecordReader<InternalRow> reader(Split split) throws IOException {
-        DataSplit dataSplit = (DataSplit) split;
-        for (SplitReadProvider readProvider : readProviders) {
-            if (readProvider.match(dataSplit, forceKeepDelete)) {
-                return readProvider.get().get().createReader(dataSplit);
+        if (split instanceof DataSplit) {
+            DataSplit dataSplit = (DataSplit) split;
+            for (SplitReadProvider readProvider : readProviders) {
+                if (readProvider.match(dataSplit, forceKeepDelete)) {
+                    return readProvider.get().get().createReader(dataSplit);
+                }
+            }
+        } else {
+            SplitReadProvider.Context context = new Context(forceKeepDelete);
+            for (SplitReadProvider readProvider : readProviders) {
+                if (readProvider.match(split, context)) {
+                    return readProvider.get().get().createRecordReader(split);
+                }
             }
         }
-
         throw new RuntimeException("Should not happen.");
     }
 

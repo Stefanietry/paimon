@@ -46,7 +46,6 @@ import org.apache.paimon.table.sink.TableCommitImpl;
 import org.apache.paimon.table.sink.WriteSelector;
 import org.apache.paimon.table.source.DataTableBatchScan;
 import org.apache.paimon.table.source.DataTableStreamScan;
-import org.apache.paimon.table.source.ScanFactory;
 import org.apache.paimon.table.source.SplitGenerator;
 import org.apache.paimon.table.source.StreamDataTableScan;
 import org.apache.paimon.table.source.snapshot.SnapshotReader;
@@ -275,7 +274,7 @@ abstract class AbstractFileStoreTable implements FileStoreTable {
 
     @Override
     public DataTableBatchScan newScan() {
-        return ScanFactory.createBatchDataTableScan(
+        return new DataTableBatchScan(
                 tableSchema,
                 schemaManager(),
                 coreOptions(),
@@ -377,11 +376,8 @@ abstract class AbstractFileStoreTable implements FileStoreTable {
     @Override
     public FileStoreTable copy(TableSchema newTableSchema) {
         AbstractFileStoreTable copied =
-                newTableSchema.primaryKeys().isEmpty()
-                        ? new AppendOnlyFileStoreTable(
-                                fileIO, path, newTableSchema, catalogEnvironment)
-                        : new PrimaryKeyFileStoreTable(
-                                fileIO, path, newTableSchema, catalogEnvironment);
+                FileStoreTableFactory.createFileStoreTable(
+                        fileIO, path, newTableSchema, newTableSchema.options(), catalogEnvironment);
         if (snapshotCache != null) {
             copied.setSnapshotCache(snapshotCache);
         }
@@ -712,16 +708,8 @@ abstract class AbstractFileStoreTable implements FileStoreTable {
         Options branchOptions = new Options(branchSchema.options());
         branchOptions.set(CoreOptions.BRANCH, targetBranch);
         branchSchema = branchSchema.copy(branchOptions.toMap());
-        Identifier currentIdentifier = identifier();
-        CatalogEnvironment newCatalogEnvironment =
-                catalogEnvironment.copy(
-                        new Identifier(
-                                currentIdentifier.getDatabaseName(),
-                                currentIdentifier.getTableName(),
-                                targetBranch,
-                                currentIdentifier.getSystemTableName()));
         return FileStoreTableFactory.create(
-                fileIO(), location(), branchSchema, new Options(), newCatalogEnvironment);
+                fileIO(), location(), branchSchema, new Options(), catalogEnvironment());
     }
 
     private RollbackHelper rollbackHelper() {

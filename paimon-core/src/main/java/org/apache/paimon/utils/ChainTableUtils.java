@@ -22,9 +22,9 @@ import org.apache.paimon.CoreOptions;
 import org.apache.paimon.CoreOptions.ChainBranchReadMode;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.table.ChainFileStoreTable;
+import org.apache.paimon.table.ChainGroupReadTable;
 import org.apache.paimon.table.FallbackReadFileStoreTable;
 import org.apache.paimon.table.FileStoreTable;
-import org.apache.paimon.table.PrimaryKeyFileStoreTable;
 import org.apache.paimon.table.Table;
 
 import java.util.Map;
@@ -44,9 +44,6 @@ public class ChainTableUtils {
                     fileStoreTable instanceof FallbackReadFileStoreTable
                             ? ((FallbackReadFileStoreTable) fileStoreTable).primaryTable()
                             : fileStoreTable;
-            Preconditions.checkArgument(
-                    candidateFileStoreTable instanceof PrimaryKeyFileStoreTable,
-                    "Chain table must be primary key table.");
             return candidateFileStoreTable;
         } else {
             return fileStoreTable;
@@ -60,13 +57,16 @@ public class ChainTableUtils {
                         : CoreOptions.fromMap(table.options());
         if (isScanFallbackChainBranch(options) && table instanceof FallbackReadFileStoreTable) {
             FileStoreTable fileStoreTable;
-            ChainFileStoreTable chainFileStoreTable =
-                    (ChainFileStoreTable) (((FallbackReadFileStoreTable) table).fallback());
+            ChainGroupReadTable chainGroupReadTable =
+                    (ChainGroupReadTable) (((FallbackReadFileStoreTable) table).fallback());
             if (isChainScanFallbackSnapshotBranch(options)) {
-                fileStoreTable = chainFileStoreTable.primaryTable();
+                fileStoreTable = chainGroupReadTable.primaryTable();
             } else {
-                fileStoreTable = chainFileStoreTable.fallback();
+                fileStoreTable = chainGroupReadTable.fallback();
             }
+            Preconditions.checkArgument(
+                    fileStoreTable instanceof ChainFileStoreTable,
+                    "Chain table must be ChainFileStoreTable.");
             fileStoreTable
                     .schema()
                     .options()
@@ -97,9 +97,9 @@ public class ChainTableUtils {
                         || branch.equalsIgnoreCase(options.scanFallbackDeltaBranch()));
     }
 
-    public static boolean isScanFallbackChainRead(Map<String, String> tableOptions) {
-        CoreOptions options = CoreOptions.fromMap(tableOptions);
-        return isScanFallbackChainRead(options);
+    public static boolean isScanFallbackChainBranch(Map<String, String> options) {
+        CoreOptions coreOptions = CoreOptions.fromMap(options);
+        return isScanFallbackChainBranch(coreOptions);
     }
 
     public static boolean isScanFallbackChainRead(CoreOptions options) {

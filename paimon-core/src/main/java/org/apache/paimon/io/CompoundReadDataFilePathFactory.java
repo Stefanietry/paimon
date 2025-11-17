@@ -24,14 +24,12 @@ import org.apache.paimon.manifest.FileEntry;
 
 import javax.annotation.Nullable;
 
-import java.util.Map;
-
 /** Factory which produces read {@link Path}s data files for chain tbl. */
-public class ChainReadDataFilePathFactory extends DataFilePathFactory {
+public class CompoundReadDataFilePathFactory extends DataFilePathFactory {
 
-    private final Map<String, String> fileBucketPathMapping;
+    private final ReadContext readContext;
 
-    public ChainReadDataFilePathFactory(
+    public CompoundReadDataFilePathFactory(
             Path parent,
             String formatIdentifier,
             String dataFilePrefix,
@@ -39,7 +37,7 @@ public class ChainReadDataFilePathFactory extends DataFilePathFactory {
             boolean fileSuffixIncludeCompression,
             String fileCompression,
             @Nullable ExternalPathProvider externalPathProvider,
-            Map<String, String> fileBucketPathMapping) {
+            ReadContext readContext) {
         super(
                 parent,
                 formatIdentifier,
@@ -48,7 +46,7 @@ public class ChainReadDataFilePathFactory extends DataFilePathFactory {
                 fileSuffixIncludeCompression,
                 fileCompression,
                 externalPathProvider);
-        this.fileBucketPathMapping = fileBucketPathMapping;
+        this.readContext = readContext;
     }
 
     @Override
@@ -60,7 +58,10 @@ public class ChainReadDataFilePathFactory extends DataFilePathFactory {
     public Path toPath(DataFileMeta file) {
         return file.externalPath()
                 .map(Path::new)
-                .orElse(new Path(fileBucketPathMapping.get(file.fileName()), file.fileName()));
+                .orElse(
+                        new Path(
+                                readContext.fileBucketPathMapping().get(file.fileName()),
+                                file.fileName()));
     }
 
     @Override

@@ -18,12 +18,8 @@
 
 package org.apache.paimon.table.source;
 
-/** Type of the data split. */
-public enum DataSplitType {
-    DATA_SPLIT,
-    CHAIN_DATA_SPLIT;
+public class DataSplitContext {
 
-    public static boolean isChainSplit(String dataSplitType) {
-        return DataSplitType.CHAIN_DATA_SPLIT.name().equalsIgnoreCase(dataSplitType);
-    }
+    public static final long DATA_SPLIT_MAGIC = -2394839472490812314L;
+    public static final int DATA_SPLIT_VERSION = 8;
 }

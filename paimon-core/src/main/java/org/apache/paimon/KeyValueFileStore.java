@@ -39,7 +39,6 @@ import org.apache.paimon.schema.SchemaManager;
 import org.apache.paimon.schema.TableSchema;
 import org.apache.paimon.table.BucketMode;
 import org.apache.paimon.table.CatalogEnvironment;
-import org.apache.paimon.table.source.ScanFactory;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.KeyComparatorSupplier;
 import org.apache.paimon.utils.UserDefinedSeqComparator;
@@ -61,12 +60,12 @@ public class KeyValueFileStore extends AbstractFileStore<KeyValue> {
 
     private final boolean crossPartitionUpdate;
     private final RowType bucketKeyType;
-    private final RowType keyType;
-    private final RowType valueType;
-    private final KeyValueFieldsExtractor keyValueFieldsExtractor;
+    protected final RowType keyType;
+    protected final RowType valueType;
+    protected final KeyValueFieldsExtractor keyValueFieldsExtractor;
     private final Supplier<Comparator<InternalRow>> keyComparatorSupplier;
     private final Supplier<RecordEqualiser> logDedupEqualSupplier;
-    private final MergeFunctionFactory<KeyValue> mfFactory;
+    protected final MergeFunctionFactory<KeyValue> mfFactory;
 
     public KeyValueFileStore(
             FileIO fileIO,
@@ -112,7 +111,7 @@ public class KeyValueFileStore extends AbstractFileStore<KeyValue> {
 
     @Override
     public MergeFileSplitRead newRead() {
-        return ScanFactory.createMergeFileSplitRead(
+        return new MergeFileSplitRead(
                 options,
                 schema,
                 keyType,
@@ -123,14 +122,14 @@ public class KeyValueFileStore extends AbstractFileStore<KeyValue> {
     }
 
     public RawFileSplitRead newBatchRawFileRead() {
-        return ScanFactory.createBatchRawFileRead(
+        return new RawFileSplitRead(
                 fileIO,
                 schemaManager,
                 schema,
                 valueType,
                 FileFormatDiscover.of(options),
                 pathFactory(),
-                options,
+                options.fileIndexReadEnabled(),
                 false);
     }
 

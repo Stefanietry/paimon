@@ -47,7 +47,6 @@ import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -62,8 +61,8 @@ import static org.apache.paimon.utils.Preconditions.checkState;
 public class DataSplit implements Split {
 
     private static final long serialVersionUID = 7L;
-    private static final long MAGIC = -2394839472490812314L;
-    private static final int VERSION = 8;
+    private static final long MAGIC = DataSplitContext.DATA_SPLIT_MAGIC;
+    private static final int VERSION = DataSplitContext.DATA_SPLIT_VERSION;
 
     private long snapshotId = 0;
     private BinaryRow partition;
@@ -133,26 +132,6 @@ public class DataSplit implements Split {
 
     public OptionalLong earliestFileCreationEpochMillis() {
         return this.dataFiles.stream().mapToLong(DataFileMeta::creationTimeEpochMillis).min();
-    }
-
-    public BinaryRow readPartition() {
-        return partition();
-    }
-
-    public HashMap<String, String> fileBucketPathMapping() {
-        throw new UnsupportedOperationException("fileMappings is not supported");
-    }
-
-    public HashMap<String, String> fileBranchMapping() {
-        throw new UnsupportedOperationException("fileMappings is not supported");
-    }
-
-    public String dataSplitType() {
-        return DataSplitType.DATA_SPLIT.name();
-    }
-
-    public List<DeletionFile> dataDeletionFiles() {
-        return dataDeletionFiles;
     }
 
     @Override
@@ -476,7 +455,7 @@ public class DataSplit implements Split {
         return builder.build();
     }
 
-    private static FunctionWithIOException<DataInputView, DataFileMeta> getFileMetaSerde(
+    public static FunctionWithIOException<DataInputView, DataFileMeta> getFileMetaSerde(
             int version) {
         if (version == 1) {
             DataFileMeta08Serializer serializer = new DataFileMeta08Serializer();

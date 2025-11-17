@@ -22,9 +22,7 @@ import org.apache.paimon.io.DataFileMeta;
 import org.apache.paimon.io.DataInputDeserializer;
 import org.apache.paimon.io.DataOutputSerializer;
 import org.apache.paimon.table.FileStoreTable;
-import org.apache.paimon.table.source.ChainDataSplit;
 import org.apache.paimon.table.source.DataSplit;
-import org.apache.paimon.table.source.DataSplitType;
 import org.apache.paimon.utils.InstantiationUtil;
 
 import org.apache.hadoop.fs.Path;
@@ -43,8 +41,6 @@ public class PaimonInputSplit extends FileSplit {
     private static final String[] ANYWHERE = new String[] {"*"};
 
     private String path;
-
-    private String dataSplitType;
     private DataSplit split;
 
     private FileStoreTable table;
@@ -54,7 +50,6 @@ public class PaimonInputSplit extends FileSplit {
 
     public PaimonInputSplit(String path, DataSplit split, FileStoreTable table) {
         this.path = path;
-        this.dataSplitType = split.dataSplitType();
         this.split = split;
         this.table = table;
     }
@@ -90,7 +85,6 @@ public class PaimonInputSplit extends FileSplit {
     @Override
     public void write(DataOutput dataOutput) throws IOException {
         dataOutput.writeUTF(path);
-        dataOutput.writeUTF(dataSplitType);
         DataOutputSerializer out = new DataOutputSerializer(128);
         split.serialize(out);
         dataOutput.writeInt(out.length());
@@ -111,14 +105,10 @@ public class PaimonInputSplit extends FileSplit {
     @Override
     public void readFields(DataInput dataInput) throws IOException {
         path = dataInput.readUTF();
-        dataSplitType = dataInput.readUTF();
         int length = dataInput.readInt();
         byte[] bytes = new byte[length];
         dataInput.readFully(bytes);
-        split =
-                DataSplitType.isChainSplit(dataSplitType)
-                        ? ChainDataSplit.deserialize(new DataInputDeserializer(bytes))
-                        : DataSplit.deserialize(new DataInputDeserializer(bytes));
+        split = DataSplit.deserialize(new DataInputDeserializer(bytes));
         readFileStoreTable(dataInput);
     }
 

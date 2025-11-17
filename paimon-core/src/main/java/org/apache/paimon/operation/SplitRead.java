@@ -23,6 +23,7 @@ import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.predicate.TopN;
 import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.table.source.DataSplit;
+import org.apache.paimon.table.source.Split;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.IOFunction;
 
@@ -61,6 +62,10 @@ public interface SplitRead<T> {
     /** Create a {@link RecordReader} from split. */
     RecordReader<T> createReader(DataSplit split) throws IOException;
 
+    default RecordReader<T> createRecordReader(Split split) throws IOException {
+        throw new UnsupportedOperationException();
+    }
+
     static <L, R> SplitRead<R> convert(
             SplitRead<L> read, IOFunction<DataSplit, RecordReader<R>> convertedFactory) {
         return new SplitRead<R>() {
@@ -97,6 +102,53 @@ public interface SplitRead<T> {
             @Override
             public RecordReader<R> createReader(DataSplit split) throws IOException {
                 return convertedFactory.apply(split);
+            }
+        };
+    }
+
+    static <L, R> SplitRead<R> convert(
+            SplitRead<L> read,
+            IOFunction<DataSplit, RecordReader<R>> dataSplitConvert,
+            IOFunction<Split, RecordReader<R>> splitConvert) {
+        return new SplitRead<R>() {
+            @Override
+            public SplitRead<R> forceKeepDelete() {
+                read.forceKeepDelete();
+                return this;
+            }
+
+            @Override
+            public SplitRead<R> withIOManager(@Nullable IOManager ioManager) {
+                read.withIOManager(ioManager);
+                return this;
+            }
+
+            @Override
+            public SplitRead<R> withReadType(RowType readType) {
+                read.withReadType(readType);
+                return this;
+            }
+
+            @Override
+            public SplitRead<R> withFilter(@Nullable Predicate predicate) {
+                read.withFilter(predicate);
+                return this;
+            }
+
+            @Override
+            public SplitRead<R> withRowIds(@Nullable List<Long> indices) {
+                read.withRowIds(indices);
+                return this;
+            }
+
+            @Override
+            public RecordReader<R> createReader(DataSplit split) throws IOException {
+                return dataSplitConvert.apply(split);
+            }
+
+            @Override
+            public RecordReader<R> createRecordReader(Split split) throws IOException {
+                return splitConvert.apply(split);
             }
         };
     }

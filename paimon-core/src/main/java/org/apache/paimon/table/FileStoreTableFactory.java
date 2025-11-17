@@ -27,6 +27,7 @@ import org.apache.paimon.fs.Path;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.schema.SchemaManager;
 import org.apache.paimon.schema.TableSchema;
+import org.apache.paimon.utils.ChainTableUtils;
 import org.apache.paimon.utils.StringUtils;
 
 import org.slf4j.Logger;
@@ -34,6 +35,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.util.Map;
 import java.util.Optional;
 
 import static org.apache.paimon.CoreOptions.PATH;
@@ -169,31 +171,31 @@ public class FileStoreTableFactory {
                 CoreOptions.CHAIN_TABLE_BRANCH_INTERNAL_READ_MODE, ChainBranchReadMode.CHAIN_READ);
         Optional<TableSchema> snapshotSchema =
                 new SchemaManager(fileIO, tablePath, scanFallbackSnapshotBranch).latest();
-        FileStoreTable snapshotTable =
-                createWithoutFallbackBranch(
-                        fileIO,
-                        tablePath,
-                        snapshotSchema.get(),
-                        snapshotBranchOptions,
-                        catalogEnvironment);
+        AbstractFileStoreTable snapshotTable =
+                (AbstractFileStoreTable)
+                        createWithoutFallbackBranch(
+                                fileIO,
+                                tablePath,
+                                snapshotSchema.get(),
+                                snapshotBranchOptions,
+                                catalogEnvironment);
         Options deltaBranchOptions = new Options(dynamicOptions.toMap());
         deltaBranchOptions.set(CoreOptions.BRANCH, scanFallbackDeltaBranch);
         deltaBranchOptions.set(
                 CoreOptions.CHAIN_TABLE_BRANCH_INTERNAL_READ_MODE, ChainBranchReadMode.CHAIN_READ);
         Optional<TableSchema> deltaSchema =
                 new SchemaManager(fileIO, tablePath, scanFallbackDeltaBranch).latest();
-        FileStoreTable deltaTable =
-                createWithoutFallbackBranch(
-                        fileIO,
-                        tablePath,
-                        deltaSchema.get(),
-                        deltaBranchOptions,
-                        catalogEnvironment);
-        ChainFileStoreTable chainFileStoreTable =
-                new ChainFileStoreTable(
-                        (AbstractFileStoreTable) snapshotTable,
-                        (AbstractFileStoreTable) deltaTable);
-        return new FallbackReadFileStoreTable(table, chainFileStoreTable);
+        AbstractFileStoreTable deltaTable =
+                (AbstractFileStoreTable)
+                        createWithoutFallbackBranch(
+                                fileIO,
+                                tablePath,
+                                deltaSchema.get(),
+                                deltaBranchOptions,
+                                catalogEnvironment);
+        FileStoreTable chainGroupFileStoreTable =
+                new ChainGroupReadTable(snapshotTable, deltaTable);
+        return new FallbackReadFileStoreTable(table, chainGroupFileStoreTable);
     }
 
     public static FileStoreTable createWithoutFallbackBranch(
@@ -203,11 +205,23 @@ public class FileStoreTableFactory {
             Options dynamicOptions,
             CatalogEnvironment catalogEnvironment) {
         FileStoreTable table =
-                tableSchema.primaryKeys().isEmpty()
-                        ? new AppendOnlyFileStoreTable(
-                                fileIO, tablePath, tableSchema, catalogEnvironment)
-                        : new PrimaryKeyFileStoreTable(
-                                fileIO, tablePath, tableSchema, catalogEnvironment);
+                createFileStoreTable(
+                        fileIO, tablePath, tableSchema, dynamicOptions.toMap(), catalogEnvironment);
         return table.copy(dynamicOptions.toMap());
+    }
+
+    public static AbstractFileStoreTable createFileStoreTable(
+            FileIO fileIO,
+            Path tablePath,
+            TableSchema tableSchema,
+            Map<String, String> options,
+            CatalogEnvironment catalogEnvironment) {
+        if (tableSchema.primaryKeys().isEmpty()) {
+            return new AppendOnlyFileStoreTable(fileIO, tablePath, tableSchema, catalogEnvironment);
+        }
+        if (ChainTableUtils.isScanFallbackChainBranch(options)) {
+            return new ChainFileStoreTable(fileIO, tablePath, tableSchema, catalogEnvironment);
+        }
+        return new PrimaryKeyFileStoreTable(fileIO, tablePath, tableSchema, catalogEnvironment);
     }
 }

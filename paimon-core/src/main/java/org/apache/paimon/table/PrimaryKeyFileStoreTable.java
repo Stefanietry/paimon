@@ -54,7 +54,7 @@ public class PrimaryKeyFileStoreTable extends AbstractFileStoreTable {
 
     private static final long serialVersionUID = 1L;
 
-    private transient KeyValueFileStore lazyStore;
+    protected transient KeyValueFileStore lazyStore;
 
     @VisibleForTesting
     PrimaryKeyFileStoreTable(FileIO fileIO, Path path, TableSchema tableSchema) {
@@ -84,25 +84,31 @@ public class PrimaryKeyFileStoreTable extends AbstractFileStoreTable {
             if (options.needLookup()) {
                 mfFactory = LookupMergeFunction.wrap(mfFactory, options, keyType, rowType);
             }
-
-            lazyStore =
-                    new KeyValueFileStore(
-                            fileIO(),
-                            schemaManager(),
-                            tableSchema,
-                            tableSchema.crossPartitionUpdate(),
-                            options,
-                            tableSchema.logicalPartitionType(),
-                            PrimaryKeyTableUtils.addKeyNamePrefix(
-                                    tableSchema.logicalBucketKeyType()),
-                            keyType,
-                            rowType,
-                            extractor,
-                            mfFactory,
-                            name(),
-                            catalogEnvironment);
+            lazyStore = createKeyValueFileStore(options, keyType, rowType, extractor, mfFactory);
         }
         return lazyStore;
+    }
+
+    protected KeyValueFileStore createKeyValueFileStore(
+            CoreOptions options,
+            RowType keyType,
+            RowType rowType,
+            KeyValueFieldsExtractor extractor,
+            MergeFunctionFactory<KeyValue> mfFactory) {
+        return new KeyValueFileStore(
+                fileIO(),
+                schemaManager(),
+                tableSchema,
+                tableSchema.crossPartitionUpdate(),
+                options,
+                tableSchema.logicalPartitionType(),
+                PrimaryKeyTableUtils.addKeyNamePrefix(tableSchema.logicalBucketKeyType()),
+                keyType,
+                rowType,
+                extractor,
+                mfFactory,
+                name(),
+                catalogEnvironment);
     }
 
     @Override
