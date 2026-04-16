@@ -44,6 +44,7 @@ import org.apache.paimon.types.TinyIntType;
 import org.apache.paimon.types.VarBinaryType;
 import org.apache.paimon.types.VarCharType;
 import org.apache.paimon.types.VariantType;
+import org.apache.paimon.types.VectorType;
 
 import org.apache.spark.sql.paimon.shims.SparkShimLoader;
 import org.apache.spark.sql.types.DataType;
@@ -240,6 +241,13 @@ public class SparkTypeUtils {
         public DataType visit(ArrayType arrayType) {
             org.apache.paimon.types.DataType elementType = arrayType.getElementType();
             return DataTypes.createArrayType(elementType.accept(this), elementType.isNullable());
+        }
+
+        @Override
+        public DataType visit(VectorType vectorType) {
+            ArrayType arrayType =
+                    new ArrayType(vectorType.isNullable(), vectorType.getElementType());
+            return this.visit(arrayType);
         }
 
         @Override
