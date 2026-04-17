@@ -19,6 +19,7 @@
 package org.apache.paimon.format.vortex;
 
 import org.apache.paimon.arrow.vector.ArrowFormatWriter;
+import org.apache.paimon.format.BundleFormatWriter;
 import org.apache.paimon.format.FormatWriter;
 import org.apache.paimon.format.FormatWriterFactory;
 import org.apache.paimon.format.SupportsDirectWrite;
@@ -60,6 +61,22 @@ public class VortexWriterFactory implements FormatWriterFactory, SupportsDirectW
 
     @Override
     public FormatWriter create(FileIO fileIO, Path path, String compression) throws IOException {
+        String scheme = path.toUri().getScheme();
+        if (VortexUtils.isHdfsScheme(scheme)) {
+            java.nio.file.Path localFile = VortexUtils.createLocalTempFileForWrite();
+            Path localPath = VortexUtils.toLocalPath(localFile);
+            BundleFormatWriter delegate =
+                    new VortexRecordsWriter(
+                            rowType,
+                            arrowFormatWriterSupplier.get(),
+                            localPath,
+                            java.util.Collections.emptyMap());
+            LOG.info(
+                    "Vortex file format will stage file locally for HDFS path: {} -> {}",
+                    path,
+                    localPath);
+            return new VortexStagingWriter(delegate, fileIO, path, localFile);
+        }
         Pair<Path, Map<String, String>> vortexSpecified = toVortexSpecified(fileIO, path);
         return new VortexRecordsWriter(
                 rowType,

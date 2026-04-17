@@ -122,7 +122,13 @@ public class VortexRecordsWriter implements BundleFormatWriter {
         ArrowCStruct cStruct =
                 ArrowUtils.serializeToCStruct(vsr, arrowArray, arrowSchema, allocator);
         long t1 = System.currentTimeMillis();
-        nativeWriter.writeBatchFfi(cStruct.arrayAddress(), cStruct.schemaAddress());
+        try {
+            nativeWriter.writeBatchFfi(cStruct.arrayAddress(), cStruct.schemaAddress());
+        } finally {
+            // Release C Data export resources if they are not released by native code.
+            arrowArray.release();
+            arrowSchema.release();
+        }
         jniCost += (System.currentTimeMillis() - t1);
     }
 }

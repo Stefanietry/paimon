@@ -52,6 +52,35 @@ public class VortexReaderFactory implements FormatReaderFactory {
     public FileRecordReader<InternalRow> createReader(Context context) {
         long[] rowIndices = toRowIndices(context.selection());
         Expression predicate = VortexPredicateConverter.toVortexExpression(predicates);
+        String scheme = context.filePath().toUri().getScheme();
+
+        if (VortexUtils.isHdfsScheme(scheme)) {
+
+            try {
+
+                java.nio.file.Path localFile =
+                        VortexUtils.downloadToLocalFile(context.fileIO(), context.filePath());
+
+                Path localPath = VortexUtils.toLocalPath(localFile);
+
+                return new VortexStagingRecordsReader(
+                        context.filePath(),
+                        localFile,
+                        new VortexRecordsReader(
+                                localPath,
+                                projectedRowType,
+                                rowIndices,
+                                predicate,
+                                java.util.Collections.emptyMap()));
+
+            } catch (Exception e) {
+
+                throw new RuntimeException(
+                        "Failed to stage Vortex file locally for HDFS path: "
+                                + context.filePath().toUri(),
+                        e);
+            }
+        }
         Pair<Path, Map<String, String>> vortexSpecified =
                 toVortexSpecified(context.fileIO(), context.filePath());
         return new VortexRecordsReader(

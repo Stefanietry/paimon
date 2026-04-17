@@ -18,15 +18,17 @@
 
 package org.apache.paimon.format.vortex;
 
-import org.apache.paimon.fs.FileIO;
-import org.apache.paimon.fs.Path;
-import org.apache.paimon.fs.PluginFileIO;
+import org.apache.paimon.fs.*;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.rest.RESTTokenFileIO;
+import org.apache.paimon.utils.IOUtils;
 import org.apache.paimon.utils.Pair;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.URI;
+import java.nio.file.Files;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -100,6 +102,69 @@ public class VortexUtils {
         }
 
         return Pair.of(converted, storageOptions);
+    }
+
+    public static boolean isHdfsScheme(String scheme) {
+        return "hdfs".equalsIgnoreCase(scheme) || "viewfs".equalsIgnoreCase(scheme);
+    }
+
+    /** Create a local temp file path for Vortex native writer to create. */
+    public static java.nio.file.Path createLocalTempFileForWrite() throws IOException {
+        java.nio.file.Path tmp = Files.createTempFile("paimon-vortex-", ".vortex");
+        // Vortex writer expects to create the file itself.
+        Files.deleteIfExists(tmp);
+        return tmp;
+    }
+
+    /** Download a remote file (e.g. HDFS) to local tmp for Vortex native reader. */
+    public static java.nio.file.Path downloadToLocalFile(FileIO fileIO, Path sourcePath)
+            throws IOException {
+        java.nio.file.Path tmp = Files.createTempFile("paimon-vortex-", ".vortex");
+        try (SeekableInputStream in = fileIO.newInputStream(sourcePath);
+                OutputStream out = Files.newOutputStream(tmp)) {
+            IOUtils.copyBytes(in, out, IOUtils.BLOCKSIZE, false);
+        } catch (IOException e) {
+            deleteLocalFileQuietly(tmp);
+            throw e;
+        }
+        return tmp;
+    }
+
+    /** Upload a local file created by Vortex native writer to remote filesystem (e.g. HDFS). */
+    public static void uploadLocalFile(
+            FileIO targetFileIO, java.nio.file.Path localFile, Path target) throws IOException {
+        boolean success = false;
+        try {
+            Path parent = target.getParent();
+            if (parent != null) {
+                targetFileIO.mkdirs(parent);
+            }
+
+            try (InputStream in = Files.newInputStream(localFile);
+                    PositionOutputStream out = targetFileIO.newOutputStream(target, false)) {
+                IOUtils.copyBytes(in, out, IOUtils.BLOCKSIZE, false);
+            }
+            success = true;
+        } finally {
+            if (!success) {
+                targetFileIO.deleteQuietly(target);
+            }
+        }
+    }
+
+    public static void deleteLocalFileQuietly(java.nio.file.Path localFile) {
+        if (localFile == null) {
+            return;
+        }
+        try {
+            Files.deleteIfExists(localFile);
+        } catch (Exception ignored) {
+            // ignore
+        }
+    }
+
+    public static Path toLocalPath(java.nio.file.Path localFile) {
+        return new Path(localFile.toUri().toString());
     }
 
     private static Options invokeHadoopOptions(Object fileIO) {
