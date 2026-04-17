@@ -270,7 +270,24 @@ public class SparkInternalRowWrapper implements InternalRow, Serializable {
 
     @Override
     public InternalVector getVector(int pos) {
-        throw new UnsupportedOperationException("Not support VectorType yet.");
+        int actualPos = getActualFieldPosition(pos);
+
+        if (actualPos == -1 || internalRow.isNullAt(actualPos)) {
+
+            return null;
+        }
+
+        DataType dataType = tableSchema.fields()[pos].dataType();
+
+        if (!(dataType instanceof ArrayType)) {
+
+            throw new UnsupportedOperationException("Not a vector type: " + dataType);
+        }
+
+        ArrayType arrayType = (ArrayType) dataType;
+
+        return new SparkInternalVector(
+                validateVectorArrayData(internalRow.getArray(actualPos)), arrayType.elementType());
     }
 
     @Override
@@ -313,6 +330,22 @@ public class SparkInternalRowWrapper implements InternalRow, Serializable {
         } else {
             throw new UnsupportedOperationException("Unsupported data type:" + dataType);
         }
+    }
+
+    private static ArrayData validateVectorArrayData(ArrayData arrayData) {
+
+        int numElements = arrayData.numElements();
+
+        for (int i = 0; i < numElements; i++) {
+
+            if (arrayData.isNullAt(i)) {
+
+                throw new IllegalArgumentException(
+                        "VectorType does not support null element at index " + i);
+            }
+        }
+
+        return arrayData;
     }
 
     /** adapt to spark internal array. */
@@ -446,7 +479,14 @@ public class SparkInternalRowWrapper implements InternalRow, Serializable {
 
         @Override
         public InternalVector getVector(int pos) {
-            throw new UnsupportedOperationException("Not support VectorType yet.");
+            if (!(elementType instanceof ArrayType)) {
+
+                throw new UnsupportedOperationException("Not a vector type: " + elementType);
+            }
+
+            ArrayType arrayType = (ArrayType) elementType;
+            return new SparkInternalVector(
+                    validateVectorArrayData(arrayData.getArray(pos)), arrayType.elementType());
         }
 
         @Override
@@ -460,6 +500,20 @@ public class SparkInternalRowWrapper implements InternalRow, Serializable {
         public InternalRow getRow(int pos, int numFields) {
             return new SparkInternalRowWrapper((StructType) elementType, numFields)
                     .replace(arrayData.getStruct(pos, numFields));
+        }
+    }
+
+    public static class SparkInternalVector extends SparkInternalArray implements InternalVector {
+
+        public SparkInternalVector(ArrayData arrayData, DataType elementType) {
+
+            super(arrayData, elementType);
+        }
+
+        @Override
+        public boolean isNullAt(int pos) {
+
+            return false;
         }
     }
 
