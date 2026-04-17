@@ -17,5 +17,6 @@
   <component name="VcsDirectoryMappings">
     <mapping directory="$PROJECT_DIR$" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/docs/themes/book" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/paimon-vortex/paimon-vortex-jni/vortex" vcs="Git" />
   </component>
 </project>

@@ -431,7 +431,7 @@ public class HiveCatalog extends AbstractCatalog {
             hivePartitions.add(hivePartition);
         }
         try {
-            clients().execute(client -> client.add_partitions(hivePartitions, true, false));
+            clients().execute(client -> client.add_partitions(hivePartitions, true, true));
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
