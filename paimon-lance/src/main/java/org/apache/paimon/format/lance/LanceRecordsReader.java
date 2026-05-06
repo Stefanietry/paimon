@@ -140,7 +140,11 @@ public class LanceRecordsReader implements FileRecordReader<InternalRow> {
         @Override
         public void next() {
             if (currentRangeIndex < ranges.size()) {
-                currentPosition++;
+                if (currentPosition == -1) {
+                    currentPosition = ranges.get(currentRangeIndex).getStart();
+                } else {
+                    currentPosition++;
+                }
 
                 // Check if we have reached the end of the current range
                 if (currentPosition >= ranges.get(currentRangeIndex).getEnd()) {

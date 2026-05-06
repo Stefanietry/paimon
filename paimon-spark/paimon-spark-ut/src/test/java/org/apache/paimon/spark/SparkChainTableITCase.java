@@ -2298,4 +2298,71 @@ public class SparkChainTableITCase {
 
         spark.close();
     }
+
+    @Test
+    public void testVectorSearchTable(@TempDir java.nio.file.Path tempDir) throws IOException {
+        Path warehousePath = new Path("file:" + tempDir.toString());
+        SparkSession.Builder builder = createSparkSessionBuilder(warehousePath);
+        SparkSession spark = builder.getOrCreate();
+        spark.sql("CREATE DATABASE IF NOT EXISTS my_db1");
+        spark.sql("USE spark_catalog.my_db1");
+
+        /** Create table */
+        spark.sql(
+                "CREATE TABLE IF NOT EXISTS \n"
+                        + "  `my_db1`.`vector_search` (\n"
+                        + "    `t1` BIGINT COMMENT 't1',\n"
+                        + "    `t2` STRING COMMENT 't2',\n"
+                        + "    `embs` ARRAY<FLOAT> COMMENT 'embedding'\n"
+                        + "  )  ROW FORMAT SERDE 'org.apache.paimon.hive.PaimonSerDe'\n"
+                        + "WITH\n"
+                        + "  SERDEPROPERTIES ('serialization.format' = '1') STORED AS INPUTFORMAT 'org.apache.paimon.hive.mapred.PaimonInputFormat' OUTPUTFORMAT 'org.apache.paimon.hive.mapred.PaimonOutputFormat' TBLPROPERTIES (\n"
+                        + "    'file.format' = 'parquet',\n"
+                        + "    'vector.file.format' = 'lance',\n"
+                        + "    'vector-field' = 'embs',\n"
+                        + "    'field.embs.vector-dim' = '3',\n"
+                        + "    'row-tracking.enabled' = 'true',\n"
+                        + "    'data-evolution.enabled' = 'true',\n"
+                        + "    'global-index.enabled' = 'true'\n"
+                        + "  )");
+        spark.close();
+
+        //        spark = builder.getOrCreate();
+        //        spark.sql(
+        //                "insert overwrite table  `my_db1`.`vector_search` values (1, '1',
+        // ARRAY(1.0F, 1.5F, 1.14F)),(2, '1',  ARRAY(2.0F, 2.5F, 2.14F));");
+        //
+        //        spark.close();
+        //
+        //        spark = builder.getOrCreate();
+        //        spark.sql(
+        //                "insert overwrite table  `my_db1`.`vector_search` values (3, '1',
+        // ARRAY(2.0F, 3.5F, 3.14F)),(4, '1',  ARRAY(4.0F, 4.5F, 4.14F));");
+        //        spark.close();
+        //
+        //        spark = builder.getOrCreate();
+        //        spark.sql(
+        //                "insert overwrite table  `my_db1`.`vector_search` values (5, '1',
+        // ARRAY(5.0F, 5.5F, 5.14F)),(6, '1',  ARRAY(5.0F, 6.5F, 6.14F));");
+        //        spark.close();
+
+        //        spark = builder.getOrCreate();
+        //        spark.sql("CALL sys.create_global_index(\n" +
+        //                "    table => 'my_db1.vector_search',\n" +
+        //                "    index_column => 'embs',\n" +
+        //                "    index_type => 'lumina-vector-ann',\n" +
+        //                "    options => 'lumina.index.dimension=3'\n" +
+        //                ");");
+        //        spark.close();
+
+        spark = builder.getOrCreate();
+        spark.sql(
+                "SELECT * FROM vector_search('my_db1.vector_search', 'embs', array(1.0f, 2.0f, 3.0f), 3);");
+        spark.close();
+
+        spark = builder.getOrCreate();
+        /** Drop table */
+        spark.sql("DROP TABLE IF EXISTS `my_db1`.`vector_search`;");
+        spark.close();
+    }
 }

@@ -21,13 +21,14 @@ package org.apache.paimon.index;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.io.DataFilePathFactory;
 
+import java.io.Serializable;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.apache.paimon.utils.FileStorePathFactory.INDEX_PREFIX;
 
 /** Path factory to create an index path. */
-public class IndexInDataFileDirPathFactory implements IndexPathFactory {
+public class IndexInDataFileDirPathFactory implements IndexPathFactory, Serializable {
 
     private final String uuid;
     private final DataFilePathFactory dataFilePathFactory;

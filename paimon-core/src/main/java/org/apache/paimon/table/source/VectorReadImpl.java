@@ -19,14 +19,7 @@
 package org.apache.paimon.table.source;
 
 import org.apache.paimon.fs.FileIO;
-import org.apache.paimon.globalindex.GlobalIndexIOMeta;
-import org.apache.paimon.globalindex.GlobalIndexReader;
-import org.apache.paimon.globalindex.GlobalIndexResult;
-import org.apache.paimon.globalindex.GlobalIndexScanner;
-import org.apache.paimon.globalindex.GlobalIndexer;
-import org.apache.paimon.globalindex.GlobalIndexerFactoryUtils;
-import org.apache.paimon.globalindex.OffsetGlobalIndexReader;
-import org.apache.paimon.globalindex.ScoredGlobalIndexResult;
+import org.apache.paimon.globalindex.*;
 import org.apache.paimon.globalindex.io.GlobalIndexFileReader;
 import org.apache.paimon.index.GlobalIndexMeta;
 import org.apache.paimon.index.IndexFileMeta;
@@ -37,9 +30,13 @@ import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.utils.RoaringNavigableMap64;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import javax.annotation.Nullable;
 
 import java.io.IOException;
+import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Iterator;
@@ -53,7 +50,9 @@ import static org.apache.paimon.utils.ManifestReadThreadPool.randomlyExecuteSequ
 import static org.apache.paimon.utils.Preconditions.checkNotNull;
 
 /** Implementation for {@link VectorRead}. */
-public class VectorReadImpl implements VectorRead {
+public class VectorReadImpl implements VectorRead, Serializable {
+
+    private static final Logger LOG = LoggerFactory.getLogger(VectorReadImpl.class);
 
     private final FileStoreTable table;
     private final Predicate filter;
@@ -89,6 +88,29 @@ public class VectorReadImpl implements VectorRead {
                         .create(vectorColumn, table.coreOptions().toConfiguration());
         IndexPathFactory indexPathFactory = table.store().pathFactory().globalIndexFileFactory();
         Iterator<Optional<ScoredGlobalIndexResult>> resultIterators =
+                cal(globalIndexer, indexPathFactory, splits, threadNum, preFilter);
+
+        ScoredGlobalIndexResult result = ScoredGlobalIndexResult.createEmpty();
+        while (resultIterators.hasNext()) {
+            Optional<ScoredGlobalIndexResult> next = resultIterators.next();
+            if (next.isPresent()) {
+                result = result.or(next.get());
+            }
+        }
+
+        ScoredGlobalIndexResult finalResult = result.topK(limit);
+        LOG.info("Get vector read result: {}", finalResult.results().toRangeList());
+        System.out.println("Get vector read result: " + finalResult.results().toRangeList());
+        return finalResult;
+    }
+
+    protected Iterator<Optional<ScoredGlobalIndexResult>> cal(
+            GlobalIndexer globalIndexer,
+            IndexPathFactory indexPathFactory,
+            List<VectorSearchSplit> splits,
+            Integer threadNum,
+            RoaringNavigableMap64 preFilter) {
+        Iterator<Optional<ScoredGlobalIndexResult>> resultIterators =
                 randomlyExecuteSequentialReturn(
                         split ->
                                 singletonList(
@@ -101,16 +123,7 @@ public class VectorReadImpl implements VectorRead {
                                                 preFilter)),
                         splits,
                         threadNum);
-
-        ScoredGlobalIndexResult result = ScoredGlobalIndexResult.createEmpty();
-        while (resultIterators.hasNext()) {
-            Optional<ScoredGlobalIndexResult> next = resultIterators.next();
-            if (next.isPresent()) {
-                result = result.or(next.get());
-            }
-        }
-
-        return result.topK(limit);
+        return resultIterators;
     }
 
     private Optional<RoaringNavigableMap64> preFilter(List<VectorSearchSplit> splits) {
@@ -132,7 +145,7 @@ public class VectorReadImpl implements VectorRead {
         }
     }
 
-    private Optional<ScoredGlobalIndexResult> eval(
+    protected Optional<ScoredGlobalIndexResult> eval(
             GlobalIndexer globalIndexer,
             IndexPathFactory indexPathFactory,
             long rowRangeStart,

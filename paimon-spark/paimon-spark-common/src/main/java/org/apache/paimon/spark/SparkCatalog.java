@@ -44,7 +44,9 @@ import org.apache.paimon.table.object.ObjectTable;
 import org.apache.paimon.types.BlobType;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.DataType;
+import org.apache.paimon.types.VectorType;
 import org.apache.paimon.utils.ExceptionUtils;
+import org.apache.paimon.utils.Preconditions;
 
 import org.apache.spark.sql.PaimonSparkSession$;
 import org.apache.spark.sql.SparkSession;
@@ -69,6 +71,7 @@ import org.apache.spark.sql.connector.expressions.FieldReference;
 import org.apache.spark.sql.connector.expressions.IdentityTransform;
 import org.apache.spark.sql.connector.expressions.NamedReference;
 import org.apache.spark.sql.connector.expressions.Transform;
+import org.apache.spark.sql.types.ArrayType;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
@@ -77,12 +80,7 @@ import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.stream.Collectors;
 
 import static org.apache.paimon.CoreOptions.FILE_FORMAT;
@@ -457,6 +455,7 @@ public class SparkCatalog extends SparkBaseCatalog
             StructType schema, Transform[] partitions, Map<String, String> properties) {
         Map<String, String> normalizedProperties = new HashMap<>(properties);
         List<String> blobFields = CoreOptions.blobField(properties);
+        Set<String> vectorFields = CoreOptions.fromMap(properties).vectorField();
         String provider = properties.get(TableCatalog.PROP_PROVIDER);
         if (!usePaimon(provider)) {
             if (isFormatTable(provider)) {
@@ -495,6 +494,18 @@ public class SparkCatalog extends SparkBaseCatalog
                         field.dataType() instanceof org.apache.spark.sql.types.BinaryType,
                         "The type of blob field must be binary");
                 type = new BlobType();
+            } else if (vectorFields.contains(field.name())) {
+                Preconditions.checkArgument(
+                        field.dataType() instanceof ArrayType,
+                        "The type of blob field must be array");
+                ArrayType arrayType = (ArrayType) field.dataType();
+                String key = "field.".concat(field.name()).concat(".vector-dim");
+                int length = Integer.parseInt(properties.get(key));
+                type =
+                        new VectorType(
+                                arrayType.containsNull(),
+                                length,
+                                toPaimonType(arrayType.elementType()));
             } else {
                 type = toPaimonType(field.dataType()).copy(field.nullable());
             }

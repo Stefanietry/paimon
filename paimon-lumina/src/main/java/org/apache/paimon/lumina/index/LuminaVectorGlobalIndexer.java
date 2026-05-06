@@ -27,10 +27,11 @@ import org.apache.paimon.globalindex.io.GlobalIndexFileWriter;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.types.DataType;
 
+import java.io.Serializable;
 import java.util.List;
 
 /** Lumina vector global indexer. */
-public class LuminaVectorGlobalIndexer implements GlobalIndexer {
+public class LuminaVectorGlobalIndexer implements GlobalIndexer, Serializable {
 
     private final DataType fieldType;
     private final LuminaVectorIndexOptions options;

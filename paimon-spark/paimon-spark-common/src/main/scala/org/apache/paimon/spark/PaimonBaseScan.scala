@@ -22,7 +22,7 @@ import org.apache.paimon.globalindex.GlobalIndexResult
 import org.apache.paimon.partition.PartitionPredicate
 import org.apache.paimon.predicate.{Predicate, PredicateBuilder}
 import org.apache.paimon.spark.metric.SparkMetricRegistry
-import org.apache.paimon.spark.read.{BaseScan, PaimonSupportsRuntimeFiltering}
+import org.apache.paimon.spark.read.{BaseScan, PaimonSupportsRuntimeFiltering, SparkVectorSearchBuilderImpl}
 import org.apache.paimon.spark.sources.PaimonMicroBatchStream
 import org.apache.paimon.spark.util.OptionUtils
 import org.apache.paimon.table.{DataTable, FileStoreTable, InnerTable}
@@ -70,8 +70,8 @@ abstract class PaimonBaseScan(table: InnerTable)
 
   private def evalVectorSearch(): GlobalIndexResult = {
     val vectorSearch = pushedVectorSearch.get
-    val vectorBuilder = table
-      .newVectorSearchBuilder()
+    val vectorSearchBuilder = new SparkVectorSearchBuilderImpl(table)
+    val vectorBuilder = vectorSearchBuilder
       .withVector(vectorSearch.vector())
       .withVectorColumn(vectorSearch.fieldName())
       .withLimit(vectorSearch.limit())

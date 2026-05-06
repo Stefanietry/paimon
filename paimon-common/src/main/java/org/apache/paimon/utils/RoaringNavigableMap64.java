@@ -20,17 +20,13 @@ package org.apache.paimon.utils;
 
 import org.roaringbitmap.longlong.Roaring64NavigableMap;
 
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
-import java.io.IOException;
+import java.io.*;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Objects;
 
 /** A compressed bitmap for 64-bit integer aggregated by tree. */
-public class RoaringNavigableMap64 implements Iterable<Long> {
+public class RoaringNavigableMap64 implements Iterable<Long>, Serializable {
 
     private final Roaring64NavigableMap roaring64NavigableMap;
 
@@ -67,7 +63,7 @@ public class RoaringNavigableMap64 implements Iterable<Long> {
     }
 
     public boolean isEmpty() {
-        return roaring64NavigableMap.isEmpty();
+        return roaring64NavigableMap == null || roaring64NavigableMap.isEmpty();
     }
 
     public boolean runOptimize() {

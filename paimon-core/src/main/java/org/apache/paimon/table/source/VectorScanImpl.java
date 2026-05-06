@@ -31,6 +31,9 @@ import org.apache.paimon.types.DataField;
 import org.apache.paimon.utils.Filter;
 import org.apache.paimon.utils.Range;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -44,6 +47,8 @@ import static org.apache.paimon.utils.Preconditions.checkNotNull;
 
 /** Implementation for {@link VectorScan}. */
 public class VectorScanImpl implements VectorScan {
+
+    private static final Logger LOG = LoggerFactory.getLogger(VectorScanImpl.class);
 
     private final FileStoreTable table;
     private final PartitionPredicate partitionFilter;
@@ -64,6 +69,19 @@ public class VectorScanImpl implements VectorScan {
     @Override
     public Plan scan() {
         Objects.requireNonNull(vectorColumn, "Vector column must be set");
+
+        LOG.info(
+                "Vector scan with vector column: {}， partitionFilter: {}， filter: {}",
+                vectorColumn,
+                partitionFilter,
+                filter);
+        System.out.println(
+                "Vector scan with vector column: "
+                        + vectorColumn
+                        + " partitionFilter: "
+                        + partitionFilter
+                        + " filter: "
+                        + filter);
 
         Set<Integer> filterFieldIds =
                 collectFieldNames(filter).stream()
@@ -117,6 +135,18 @@ public class VectorScanImpl implements VectorScan {
                                         return range.hasIntersection(globalIndex.rowRange());
                                     })
                             .collect(Collectors.toList());
+            LOG.info(
+                    "Vector scan split: {}， vectorFiles: {}， scalarFiles: {}",
+                    range,
+                    vectorFiles,
+                    scalarFiles);
+            System.out.println(
+                    "Vector scan split: "
+                            + range
+                            + " vectorFiles "
+                            + vectorFiles
+                            + " scalarFiles "
+                            + scalarFiles);
             splits.add(new VectorSearchSplit(range.from, range.to, vectorFiles, scalarFiles));
         }
 
