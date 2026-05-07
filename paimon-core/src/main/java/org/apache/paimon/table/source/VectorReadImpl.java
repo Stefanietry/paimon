@@ -28,6 +28,7 @@ import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.predicate.VectorSearch;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.types.DataField;
+import org.apache.paimon.utils.InstantiationUtil;
 import org.apache.paimon.utils.RoaringNavigableMap64;
 
 import org.slf4j.Logger;
@@ -54,11 +55,11 @@ public class VectorReadImpl implements VectorRead, Serializable {
 
     private static final Logger LOG = LoggerFactory.getLogger(VectorReadImpl.class);
 
-    private final FileStoreTable table;
+    protected final FileStoreTable table;
     private final Predicate filter;
-    private final int limit;
-    private final DataField vectorColumn;
-    private final float[] vector;
+    protected final int limit;
+    protected final DataField vectorColumn;
+    protected final float[] vector;
 
     public VectorReadImpl(
             FileStoreTable table,
@@ -83,12 +84,8 @@ public class VectorReadImpl implements VectorRead, Serializable {
         Integer threadNum = table.coreOptions().globalIndexThreadNum();
 
         String indexType = splits.get(0).vectorIndexFiles().get(0).indexType();
-        GlobalIndexer globalIndexer =
-                GlobalIndexerFactoryUtils.load(indexType)
-                        .create(vectorColumn, table.coreOptions().toConfiguration());
-        IndexPathFactory indexPathFactory = table.store().pathFactory().globalIndexFileFactory();
         Iterator<Optional<ScoredGlobalIndexResult>> resultIterators =
-                cal(globalIndexer, indexPathFactory, splits, threadNum, preFilter);
+                cal(indexType, splits, threadNum, preFilter);
 
         ScoredGlobalIndexResult result = ScoredGlobalIndexResult.createEmpty();
         while (resultIterators.hasNext()) {
@@ -105,25 +102,39 @@ public class VectorReadImpl implements VectorRead, Serializable {
     }
 
     protected Iterator<Optional<ScoredGlobalIndexResult>> cal(
-            GlobalIndexer globalIndexer,
-            IndexPathFactory indexPathFactory,
+            String indexType,
             List<VectorSearchSplit> splits,
             Integer threadNum,
             RoaringNavigableMap64 preFilter) {
-        Iterator<Optional<ScoredGlobalIndexResult>> resultIterators =
-                randomlyExecuteSequentialReturn(
-                        split ->
-                                singletonList(
-                                        eval(
-                                                globalIndexer,
-                                                indexPathFactory,
-                                                split.rowRangeStart(),
-                                                split.rowRangeEnd(),
-                                                split.vectorIndexFiles(),
-                                                preFilter)),
-                        splits,
-                        threadNum);
-        return resultIterators;
+        List<byte[]> splitBytes = new ArrayList<>();
+        for (VectorSearchSplit split : splits) {
+            try {
+                splitBytes.add(InstantiationUtil.serializeObject(split));
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        }
+        return randomlyExecuteSequentialReturn(
+                split -> {
+                    Optional<byte[]> res =
+                            eval(indexType, split, preFilter, table, vectorColumn, vector, limit);
+                    Optional<ScoredGlobalIndexResult> result;
+                    if (res.isPresent()) {
+                        try {
+                            result =
+                                    Optional.of(
+                                            new GlobalIndexResultSerializer()
+                                                    .deserialize(res.get()));
+                        } catch (IOException e) {
+                            throw new RuntimeException(e);
+                        }
+                    } else {
+                        result = Optional.empty();
+                    }
+                    return singletonList(result);
+                },
+                splitBytes,
+                threadNum);
     }
 
     private Optional<RoaringNavigableMap64> preFilter(List<VectorSearchSplit> splits) {
@@ -145,13 +156,30 @@ public class VectorReadImpl implements VectorRead, Serializable {
         }
     }
 
-    protected Optional<ScoredGlobalIndexResult> eval(
-            GlobalIndexer globalIndexer,
-            IndexPathFactory indexPathFactory,
-            long rowRangeStart,
-            long rowRangeEnd,
-            List<IndexFileMeta> vectorIndexFiles,
-            @Nullable RoaringNavigableMap64 includeRowIds) {
+    protected Optional<byte[]> eval(
+            String indexType,
+            byte[] splitByte,
+            @Nullable RoaringNavigableMap64 includeRowIds,
+            FileStoreTable table,
+            DataField vectorColumn,
+            float[] vector,
+            int limit) {
+        VectorSearchSplit split;
+        try {
+            split =
+                    InstantiationUtil.deserializeObject(
+                            splitByte, Thread.currentThread().getContextClassLoader());
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+        System.out.println("Vector scan split: " + split);
+        long rowRangeStart = split.rowRangeStart();
+        long rowRangeEnd = split.rowRangeEnd();
+        List<IndexFileMeta> vectorIndexFiles = split.vectorIndexFiles();
+        GlobalIndexer globalIndexer =
+                GlobalIndexerFactoryUtils.load(indexType)
+                        .create(vectorColumn, table.coreOptions().toConfiguration());
+        IndexPathFactory indexPathFactory = table.store().pathFactory().globalIndexFileFactory();
         List<GlobalIndexIOMeta> indexIOMetaList = new ArrayList<>();
         for (IndexFileMeta indexFile : vectorIndexFiles) {
             GlobalIndexMeta meta = checkNotNull(indexFile.globalIndexMeta());
@@ -169,8 +197,13 @@ public class VectorReadImpl implements VectorRead, Serializable {
             VectorSearch vectorSearch =
                     new VectorSearch(vector, limit, vectorColumn.name())
                             .withIncludeRowIds(includeRowIds);
-            return new OffsetGlobalIndexReader(reader, rowRangeStart, rowRangeEnd)
-                    .visitVectorSearch(vectorSearch);
+            Optional<ScoredGlobalIndexResult> res =
+                    new OffsetGlobalIndexReader(reader, rowRangeStart, rowRangeEnd)
+                            .visitVectorSearch(vectorSearch);
+            if (res.isPresent()) {
+                return Optional.of(new GlobalIndexResultSerializer().serialize(res.get()));
+            }
+            return Optional.empty();
         } catch (IOException e) {
             throw new RuntimeException(e);
         }

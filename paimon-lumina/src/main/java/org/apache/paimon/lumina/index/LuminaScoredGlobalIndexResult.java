@@ -22,10 +22,11 @@ import org.apache.paimon.globalindex.ScoreGetter;
 import org.apache.paimon.globalindex.ScoredGlobalIndexResult;
 import org.apache.paimon.utils.RoaringNavigableMap64;
 
+import java.io.Serializable;
 import java.util.HashMap;
 
 /** Vector search global index result for Lumina vector index. */
-public class LuminaScoredGlobalIndexResult implements ScoredGlobalIndexResult {
+public class LuminaScoredGlobalIndexResult implements ScoredGlobalIndexResult, Serializable {
 
     private final HashMap<Long, Float> id2scores;
     private final RoaringNavigableMap64 results;

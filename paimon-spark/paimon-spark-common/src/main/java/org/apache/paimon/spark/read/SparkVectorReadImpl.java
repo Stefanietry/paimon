@@ -18,29 +18,22 @@
 
 package org.apache.paimon.spark.read;
 
-import org.apache.paimon.globalindex.GlobalIndexer;
+import org.apache.paimon.globalindex.GlobalIndexResultSerializer;
 import org.apache.paimon.globalindex.ScoredGlobalIndexResult;
-import org.apache.paimon.index.IndexPathFactory;
 import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.source.VectorReadImpl;
 import org.apache.paimon.table.source.VectorSearchSplit;
 import org.apache.paimon.types.DataField;
+import org.apache.paimon.utils.InstantiationUtil;
 import org.apache.paimon.utils.RoaringNavigableMap64;
 import org.apache.paimon.utils.SerializableFunction;
 
-import org.apache.spark.api.java.JavaSparkContext;
-import org.apache.spark.sql.SparkSession;
-
+import java.io.IOException;
 import java.io.Serializable;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Optional;
-import java.util.stream.Stream;
+import java.util.*;
 
 public class SparkVectorReadImpl extends VectorReadImpl implements Serializable {
-
-    private final JavaSparkContext jsc;
 
     public SparkVectorReadImpl(
             FileStoreTable table,
@@ -49,37 +42,52 @@ public class SparkVectorReadImpl extends VectorReadImpl implements Serializable 
             DataField vectorColumn,
             float[] vector) {
         super(table, filter, limit, vectorColumn, vector);
-        jsc = new JavaSparkContext(SparkSession.builder().getOrCreate().sparkContext());
     }
 
     @Override
     protected Iterator<Optional<ScoredGlobalIndexResult>> cal(
-            GlobalIndexer globalIndexer,
-            IndexPathFactory indexPathFactory,
+            String indexType,
             List<VectorSearchSplit> splits,
             Integer threadNum,
             RoaringNavigableMap64 preFilter) {
-        return map(
-                        splits,
-                        (SerializableFunction<VectorSearchSplit, Optional<ScoredGlobalIndexResult>>)
-                                split ->
-                                        eval(
-                                                globalIndexer,
-                                                indexPathFactory,
-                                                split.rowRangeStart(),
-                                                split.rowRangeEnd(),
-                                                split.vectorIndexFiles(),
-                                                preFilter),
-                        splits.size())
-                .iterator();
-    }
-
-    public <I, O> List<O> map(List<I> data, SerializableFunction<I, O> func, int parallelism) {
-        return jsc.parallelize(data, parallelism).map(func::apply).collect();
-    }
-
-    public <I, O> List<O> flatMap(
-            List<I> data, SerializableFunction<I, Stream<O>> func, int parallelism) {
-        return jsc.parallelize(data, parallelism).flatMap(x -> func.apply(x).iterator()).collect();
+        List<byte[]> splitBytes = new ArrayList<>();
+        for (VectorSearchSplit split : splits) {
+            try {
+                splitBytes.add(InstantiationUtil.serializeObject(split));
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        }
+        List<Optional<byte[]>> res =
+                new SparkEngineContext()
+                        .map(
+                                splitBytes,
+                                (SerializableFunction<byte[], Optional<byte[]>>)
+                                        split -> {
+                                            return eval(
+                                                    indexType,
+                                                    split,
+                                                    preFilter,
+                                                    table,
+                                                    vectorColumn,
+                                                    vector,
+                                                    limit);
+                                        },
+                                splits.size());
+        List<Optional<ScoredGlobalIndexResult>> results = new ArrayList<>();
+        for (Optional<byte[]> result : res) {
+            if (result.isPresent()) {
+                try {
+                    results.add(
+                            Optional.of(
+                                    new GlobalIndexResultSerializer().deserialize(result.get())));
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            } else {
+                results.add(Optional.empty());
+            }
+        }
+        return results.iterator();
     }
 }
