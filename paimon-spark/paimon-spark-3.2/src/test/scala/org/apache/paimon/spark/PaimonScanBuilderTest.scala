@@ -43,6 +43,20 @@ class PaimonScanBuilderTest extends PaimonSparkTestBase {
         "select id, embs from vector_search(" +
           "'T', 'embs', array(1.0f, 2.0f, 3.0f), 5, map('ivf.nprobe', '16'))")
       assert(rows.isEmpty)
+
+      val explain = spark
+        .sql("""
+               |EXPLAIN
+               |SELECT q.id AS query_id, r.id AS result_id, r.score
+               |FROM T q
+               |INNER JOIN LATERAL (
+               |  SELECT id, __paimon_vector_search_score AS score
+               |  FROM vector_search('T', 'embs', q.embs, 5)
+               |) r
+               |""".stripMargin)
+        .collect()
+        .mkString("\n")
+      assert(explain.contains("LateralVectorSearch"))
     }
   }
 }

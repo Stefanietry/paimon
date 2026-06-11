@@ -41,6 +41,98 @@ class TableValuedFunctionsTest extends PaimonHiveTestBase {
     assert(error.getMessage.contains("Limit must be no greater than"))
   }
 
+  test("lateral vector search preserves subquery alias qualifiers") {
+    withSQLConf("spark.paimon.vector-search.distribute.enabled" -> "true") {
+      withTable("vector_search_source", "vector_search_result") {
+        spark.sql("""
+                    |CREATE TABLE vector_search_source (gid BIGINT, embs ARRAY<FLOAT>, dt STRING)
+                    |USING paimon
+                    |TBLPROPERTIES (
+                    |  'vector.file.format' = 'lance',
+                    |  'vector-field' = 'embs',
+                    |  'field.embs.vector-dim' = '3',
+                    |  'row-tracking.enabled' = 'true',
+                    |  'data-evolution.enabled' = 'true')
+                    |PARTITIONED BY (dt)
+                    |""".stripMargin)
+        spark.sql("""
+                    |CREATE TABLE vector_search_result (
+                    |  query_gid BIGINT,
+                    |  query_embs ARRAY<FLOAT>,
+                    |  result_gid BIGINT,
+                    |  result_embs ARRAY<FLOAT>,
+                    |  score FLOAT,
+                    |  dt STRING)
+                    |USING paimon
+                    |PARTITIONED BY (dt)
+                    |""".stripMargin)
+
+        val explain = spark
+          .sql("""
+                 |EXPLAIN
+                 |INSERT OVERWRITE TABLE vector_search_result PARTITION (dt = '20260608')
+                 |SELECT q.gid AS query_gid, q.embs AS query_embs,
+                 |       r.gid AS result_gid, r.embs AS result_embs,
+                 |       r.__paimon_vector_search_score AS score
+                 |FROM vector_search_source AS q
+                 |INNER JOIN LATERAL (
+                 |  SELECT gid, embs, __paimon_vector_search_score
+                 |  FROM vector_search('vector_search_source', 'embs', q.embs, 5)
+                 |) AS r
+                 |WHERE q.dt = '20260608'
+                 |""".stripMargin)
+          .collect()
+          .mkString("\n")
+        assert(explain.contains("LateralVectorSearch"))
+        assert(explain.indexOf("Filter") > explain.indexOf("LateralVectorSearch"))
+
+        val explainWithoutScore = spark
+          .sql("""
+                 |EXPLAIN
+                 |SELECT q.gid AS query_gid, r.embs AS result_embs
+                 |FROM vector_search_source AS q
+                 |INNER JOIN LATERAL (
+                 |  SELECT embs
+                 |  FROM vector_search('vector_search_source', 'embs', q.embs, 5)
+                 |) AS r
+                 |""".stripMargin)
+          .collect()
+          .mkString("\n")
+        assert(explainWithoutScore.contains("LateralVectorSearch"))
+
+        val crossJoinError = intercept[Exception] {
+          spark
+            .sql("""
+                   |EXPLAIN
+                   |SELECT q.gid AS query_gid, r.gid AS result_gid
+                   |FROM vector_search_source AS q,
+                   |LATERAL (
+                   |  SELECT gid, embs, __paimon_vector_search_score
+                   |  FROM vector_search('vector_search_source', 'embs', q.embs, 5)
+                   |) AS r
+                   |""".stripMargin)
+            .collect()
+        }
+        assert(crossJoinError.getMessage.contains("only supports INNER join"))
+
+        val conditionError = intercept[Exception] {
+          spark
+            .sql("""
+                   |EXPLAIN
+                   |SELECT q.gid AS query_gid, r.gid AS result_gid
+                   |FROM vector_search_source AS q
+                   |INNER JOIN LATERAL (
+                   |  SELECT gid, embs, __paimon_vector_search_score
+                   |  FROM vector_search('vector_search_source', 'embs', q.embs, 5)
+                   |) AS r ON q.gid = r.gid
+                   |""".stripMargin)
+            .collect()
+        }
+        assert(conditionError.getMessage.contains("does not support join conditions"))
+      }
+    }
+  }
+
   withPk.foreach {
     hasPk =>
       bucketModes.foreach {

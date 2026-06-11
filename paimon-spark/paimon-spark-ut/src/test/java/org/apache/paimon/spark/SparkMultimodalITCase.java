@@ -168,6 +168,12 @@ public class SparkMultimodalITCase {
                         rows.stream()
                                 .map(row -> Pair.of(row.getLong(0), row.getString(1)))
                                 .collect(Collectors.toList()));
+
+        rows =
+                spark.sql(
+                                "SELECT q.gid AS query_gid, q.embs AS query_embs, r.gid AS result_gid FROM my_db1.vector_test AS q, LATERAL (SELECT gid  FROM vector_search('my_db1.vector_test', 'embs', q.embs, 5)) AS r WHERE q.`date` = '20260420';")
+                        .collectAsList();
+        assertThat(rows).hasSize(40);
         spark.close();
 
         spark = builder.getOrCreate();

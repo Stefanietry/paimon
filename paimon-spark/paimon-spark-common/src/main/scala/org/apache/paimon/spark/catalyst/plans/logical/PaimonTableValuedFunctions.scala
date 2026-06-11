@@ -20,17 +20,21 @@ package org.apache.paimon.spark.catalyst.plans.logical
 
 import org.apache.paimon.CoreOptions
 import org.apache.paimon.predicate.{FullTextSearch, VectorSearch}
-import org.apache.paimon.spark.SparkTable
+import org.apache.paimon.spark.{SparkTable, SparkTypeUtils}
 import org.apache.paimon.spark.catalyst.plans.logical.PaimonTableValuedFunctions._
+import org.apache.paimon.spark.schema.PaimonMetadataColumn
 import org.apache.paimon.table.{DataTable, FullTextSearchTable, InnerTable, VectorSearchTable}
 import org.apache.paimon.table.source.snapshot.TimeTravelUtil.InconsistentTagBucketException
 
-import org.apache.spark.sql.PaimonUtils.createDataset
+import org.apache.spark.sql.PaimonUtils.{createDataset, toAttributes}
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.FunctionIdentifier
 import org.apache.spark.sql.catalyst.analysis.FunctionRegistryBase
 import org.apache.spark.sql.catalyst.analysis.TableFunctionRegistry.TableFunctionBuilder
+import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeSet, CreateArray, Expression, ExpressionInfo, Literal, NamedExpression, OuterReference}
 import org.apache.spark.sql.catalyst.expressions.{Attribute, CreateArray, CreateMap, Expression, ExpressionInfo, Literal}
+import org.apache.spark.sql.catalyst.plans.{Inner, JoinType}
+import org.apache.spark.sql.catalyst.plans.logical.{LeafNode, LogicalPlan, Project, SubqueryAlias, UnaryNode}
 import org.apache.spark.sql.catalyst.plans.logical.{LeafNode, LogicalPlan}
 import org.apache.spark.sql.catalyst.util.MapData
 import org.apache.spark.sql.connector.catalog.{Identifier, Table, TableCatalog}
@@ -146,6 +150,9 @@ object PaimonTableValuedFunctions {
       argsWithoutTable: Seq[Expression]): LogicalPlan = {
     sparkTable match {
       case st @ SparkTable(innerTable: InnerTable) =>
+        if (vsq.hasOuterReference(argsWithoutTable)) {
+          return vsq.createDynamicVectorSearch(innerTable, argsWithoutTable)
+        }
         val vectorSearch = vsq.createVectorSearch(innerTable, argsWithoutTable)
         val vectorSearchTable = VectorSearchTable.create(innerTable, vectorSearch)
         DataSourceV2Relation.create(
@@ -157,6 +164,57 @@ object PaimonTableValuedFunctions {
         throw new RuntimeException(
           "vector_search only supports Paimon SparkTable backed by InnerTable, " +
             s"but got table implementation: ${sparkTable.getClass.getName}")
+    }
+  }
+
+  def resolveLateralVectorSearch(
+      left: LogicalPlan,
+      right: LogicalPlan,
+      joinType: JoinType,
+      condition: Option[Expression]): Option[LogicalPlan] = {
+    extractDynamicVectorSearch(right) match {
+      case None =>
+        None
+      case Some(_) if condition.isDefined =>
+        throw new RuntimeException("LATERAL vector_search does not support join conditions.")
+      case Some(_) if joinType != Inner =>
+        throw new RuntimeException(
+          s"LATERAL vector_search only supports INNER join, but got: $joinType.")
+      case Some((relation, projectList, projectOutput)) =>
+        val vectorSearchOutput = vectorSearchOutputForProject(relation, projectList)
+        Some(
+          LateralVectorSearch(
+            left,
+            relation.innerTable,
+            relation.columnName,
+            relation.queryVectorExpr,
+            relation.limit,
+            vectorSearchOutput,
+            projectList,
+            projectOutput))
+    }
+  }
+
+  private def vectorSearchOutputForProject(
+      relation: DynamicVectorSearchRelation,
+      projectList: Seq[NamedExpression]): Seq[Attribute] = {
+    val projectReferences = AttributeSet.fromAttributeSets(projectList.map(_.references))
+    relation.output.filter(projectReferences.contains)
+  }
+
+  private def extractDynamicVectorSearch(plan: LogicalPlan)
+      : Option[(DynamicVectorSearchRelation, Seq[NamedExpression], Seq[Attribute])] = {
+    plan match {
+      case SubqueryAlias(_, child) =>
+        extractDynamicVectorSearch(child).map {
+          case (relation, projectList, _) => (relation, projectList, plan.output)
+        }
+      case Project(projectList, relation: DynamicVectorSearchRelation)
+          if projectList.forall(_.resolved) =>
+        Some((relation, projectList, plan.output))
+      case relation: DynamicVectorSearchRelation =>
+        Some((relation, relation.output, relation.output))
+      case _ => None
     }
   }
 
@@ -338,6 +396,34 @@ case class VectorSearchQuery(override val args: Seq[Expression])
     new VectorSearch(queryVector, limit, columnName, options.asJava)
   }
 
+  def hasOuterReference(argsWithoutTable: Seq[Expression]): Boolean = {
+    argsWithoutTable.size == 3 && argsWithoutTable(1).exists(_.isInstanceOf[OuterReference])
+  }
+
+  def createDynamicVectorSearch(
+      innerTable: InnerTable,
+      argsWithoutTable: Seq[Expression]): DynamicVectorSearchRelation = {
+    if (argsWithoutTable.size != 3) {
+      throw new RuntimeException(
+        s"$VECTOR_SEARCH needs three parameters after table_name: column_name, query_vector, limit. " +
+          s"Got ${argsWithoutTable.size} parameters after table_name."
+      )
+    }
+    val columnName = argsWithoutTable.head.eval().toString
+    if (!innerTable.rowType().containsField(columnName)) {
+      throw new RuntimeException(
+        s"Column $columnName does not exist in table ${innerTable.name()}"
+      )
+    }
+    val limit = parsePositiveLimit(argsWithoutTable(2).eval())
+    DynamicVectorSearchRelation(
+      innerTable,
+      columnName,
+      argsWithoutTable(1),
+      limit,
+      toAttributes(SparkTypeUtils.fromPaimonRowType(innerTable.rowType())))
+  }
+
   private def extractQueryVector(expr: Expression): Array[Float] = {
     expr match {
       case Literal(arrayData, _) if arrayData != null =>
@@ -417,6 +503,47 @@ case class VectorSearchQuery(override val args: Seq[Expression])
       throw new IllegalArgumentException("Option key and value cannot be null.")
     }
     value.toString
+  }
+}
+
+case class DynamicVectorSearchRelation(
+    innerTable: InnerTable,
+    columnName: String,
+    queryVectorExpr: Expression,
+    limit: Int,
+    relationOutput: Seq[Attribute])
+  extends LeafNode {
+
+  private lazy val outputWithScore: Seq[Attribute] =
+    relationOutput ++
+      Seq(PaimonMetadataColumn.VECTOR_SEARCH_SCORE.toAttribute)
+
+  override def output: Seq[Attribute] = outputWithScore
+}
+
+case class LateralVectorSearch(
+    left: LogicalPlan,
+    innerTable: InnerTable,
+    columnName: String,
+    queryVectorExpr: Expression,
+    limit: Int,
+    vectorSearchOutput: Seq[Attribute],
+    projectList: Seq[NamedExpression],
+    projectOutput: Seq[Attribute])
+  extends UnaryNode {
+
+  override def child: LogicalPlan = left
+
+  override def output: Seq[Attribute] = left.output ++ projectOutput
+
+  override lazy val producedAttributes: AttributeSet = AttributeSet(vectorSearchOutput)
+
+  override lazy val references: AttributeSet = {
+    AttributeSet.fromAttributeSets(expressions.map(_.references)) -- producedAttributes
+  }
+
+  override protected def withNewChildInternal(newChild: LogicalPlan): LogicalPlan = {
+    copy(left = newChild)
   }
 }
 

@@ -19,17 +19,23 @@
 package org.apache.paimon.spark.execution
 
 import org.apache.paimon.partition.PartitionPredicate
-import org.apache.paimon.spark.{SparkCatalog, SparkGenericCatalog, SparkTable, SparkUtils}
+import org.apache.paimon.spark.{PaimonRecordReaderIterator, SparkCatalog, SparkGenericCatalog, SparkTable, SparkUtils}
 import org.apache.paimon.spark.catalog.{SparkBaseCatalog, SupportView}
 import org.apache.paimon.spark.catalyst.analysis.ResolvedPaimonView
-import org.apache.paimon.spark.catalyst.plans.logical.{CopyIntoLocationCommand, CopyIntoLocationSource, CopyIntoTableCommand, CreateOrReplaceTagCommand, CreatePaimonView, DeleteTagCommand, DropPaimonView, PaimonCallCommand, PaimonDropPartitions, RenameTagCommand, ResolvedIdentifier, ShowPaimonViews, ShowTagsCommand, TruncatePaimonTableWithFilter}
-import org.apache.paimon.table.Table
+import org.apache.paimon.spark.catalyst.plans.logical.{CopyIntoLocationCommand, CopyIntoLocationSource, CopyIntoTableCommand, CreateOrReplaceTagCommand, CreatePaimonView, DeleteTagCommand, DropPaimonView, LateralVectorSearch, PaimonCallCommand, PaimonDropPartitions, RenameTagCommand, ResolvedIdentifier, ShowPaimonViews, ShowTagsCommand, TruncatePaimonTableWithFilter}
+import org.apache.paimon.spark.data.SparkInternalRow
+import org.apache.paimon.spark.schema.PaimonMetadataColumn
+import org.apache.paimon.table.{InnerTable, Table}
+import org.apache.paimon.table.source.{InnerTableScan, ReadBuilder, VectorSearchBuilder}
+import org.apache.paimon.types.RowType
 
+import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.{ResolvedNamespace, ResolvedTable}
-import org.apache.spark.sql.catalyst.expressions.{Expression, GenericInternalRow, PredicateHelper}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeSet, Expression, GenericInternalRow, JoinedRow, NamedExpression, OuterReference, PredicateHelper, UnsafeProjection}
 import org.apache.spark.sql.catalyst.plans.logical.{CreateTableAsSelect, DescribeRelation, LogicalPlan, ReplaceTable, ReplaceTableAsSelect, ShowCreateTable}
+import org.apache.spark.sql.catalyst.util.ArrayData
 import org.apache.spark.sql.connector.catalog.{Identifier, PaimonLookupCatalog, TableCatalog}
 import org.apache.spark.sql.execution.{PaimonDescribeTableExec, SparkPlan, SparkStrategy}
 import org.apache.spark.sql.execution.datasources.v2.{DataSourceV2Implicits, DataSourceV2Relation}
@@ -60,6 +66,17 @@ case class PaimonStrategy(spark: SparkSession)
     case c @ PaimonCallCommand(procedure, args) =>
       val input = buildInternalRow(args)
       PaimonCallExec(c.output, procedure, input) :: Nil
+
+    case lvs: LateralVectorSearch =>
+      LateralVectorSearchExec(
+        lvs.innerTable,
+        lvs.columnName,
+        lvs.queryVectorExpr,
+        lvs.limit,
+        lvs.vectorSearchOutput,
+        lvs.projectList,
+        lvs.projectOutput,
+        planLater(lvs.left)) :: Nil
 
     case t @ ShowTagsCommand(PaimonCatalogAndIdentifier(catalog, ident)) =>
       ShowTagsExec(catalog, ident, t.output) :: Nil
@@ -214,4 +231,134 @@ case class PaimonStrategy(spark: SparkSession)
     val v2Relation = DataSourceV2Relation.create(r.table, Some(r.catalog), Some(r.identifier))
     SparkShimLoader.shim.classicApi.recacheByPlan(spark, v2Relation)
   }
+}
+
+case class LateralVectorSearchExec(
+    innerTable: InnerTable,
+    columnName: String,
+    queryVectorExpr: Expression,
+    limit: Int,
+    vectorSearchOutput: Seq[Attribute],
+    projectList: Seq[NamedExpression],
+    projectOutput: Seq[Attribute],
+    child: SparkPlan)
+  extends SparkPlan {
+
+  override def children: Seq[SparkPlan] = Seq(child)
+
+  override def output: Seq[Attribute] = child.output ++ projectOutput
+
+  @transient override lazy val producedAttributes: AttributeSet = AttributeSet(vectorSearchOutput)
+
+  @transient
+  override lazy val references: AttributeSet = {
+    AttributeSet.fromAttributeSets(expressions.map(_.references)) -- producedAttributes
+  }
+
+  override protected def withNewChildrenInternal(newChildren: IndexedSeq[SparkPlan]): SparkPlan = {
+    copy(child = newChildren.head)
+  }
+
+  override protected def doExecute(): RDD[InternalRow] = {
+    child.execute().mapPartitions {
+      outerRows =>
+        val strippedQueryExpr = queryVectorExpr.transform {
+          case OuterReference(namedExpression) => namedExpression.toAttribute
+        }
+        val queryVectorProjection = UnsafeProjection.create(Seq(strippedQueryExpr), child.output)
+        val rightProjection = UnsafeProjection.create(projectList, vectorSearchOutput)
+        val joinedRow = new JoinedRow
+        lazy val searchContext = createSearchContext()
+
+        outerRows.flatMap {
+          outerRow =>
+            toFloatArray(queryVectorProjection(outerRow).get(0, strippedQueryExpr.dataType)) match {
+              case Some(queryVector) =>
+                search(queryVector, searchContext).map {
+                  rightRow =>
+                    joinedRow(outerRow, rightProjection(rightRow))
+                    joinedRow.copy()
+                }
+              case None => Iterator.empty
+            }
+        }
+    }
+  }
+
+  private def createSearchContext(): LateralVectorSearchContext = {
+    val rowType = innerTable.rowType()
+    val readFieldNames = vectorSearchOutput
+      .filterNot(_.name == PaimonMetadataColumn.VECTOR_SEARCH_SCORE_COLUMN)
+      .map(_.name)
+    val readRowType = rowType.project(readFieldNames.asJava)
+    val readBuilder = innerTable.newReadBuilder().withReadType(readRowType)
+    val scoreMetadataColumns =
+      if (vectorSearchOutput.exists(_.name == PaimonMetadataColumn.VECTOR_SEARCH_SCORE_COLUMN)) {
+        Seq(PaimonMetadataColumn.VECTOR_SEARCH_SCORE)
+      } else {
+        Seq.empty
+      }
+    val resultRowType =
+      if (scoreMetadataColumns.isEmpty) {
+        readRowType
+      } else {
+        new RowType(
+          (readRowType.getFields.asScala ++ scoreMetadataColumns.map(_.toPaimonDataField)).asJava)
+      }
+    val sparkRow = SparkInternalRow.create(resultRowType)
+    val vectorSearchBuilder = innerTable
+      .newVectorSearchBuilder()
+      .withVectorColumn(columnName)
+      .withLimit(limit)
+
+    LateralVectorSearchContext(readBuilder, vectorSearchBuilder, scoreMetadataColumns, sparkRow)
+  }
+
+  private def search(
+      queryVector: Array[Float],
+      context: LateralVectorSearchContext): Iterator[InternalRow] = {
+    val globalIndexResult = context.vectorSearchBuilder.withVector(queryVector).executeLocal()
+    val scan = context.readBuilder
+      .newScan()
+      .withGlobalIndexResult(globalIndexResult)
+      .asInstanceOf[InnerTableScan]
+    val read = context.readBuilder.newRead()
+
+    scan.plan().splits().asScala.iterator.flatMap {
+      split =>
+        val reader =
+          PaimonRecordReaderIterator(read.createReader(split), context.scoreMetadataColumns, split)
+        new Iterator[InternalRow] {
+          private var closed = false
+
+          override def hasNext: Boolean = {
+            val hasNext = reader.hasNext
+            if (!hasNext && !closed) {
+              reader.close()
+              closed = true
+            }
+            hasNext
+          }
+
+          override def next(): InternalRow = {
+            context.sparkRow.replace(reader.next()).copy()
+          }
+        }
+    }
+  }
+
+  private def toFloatArray(value: Any): Option[Array[Float]] = {
+    value match {
+      case null => None
+      case arrayData: ArrayData => Some(arrayData.toFloatArray())
+      case _ =>
+        throw new RuntimeException(s"Cannot extract query vector from expression value: $value")
+    }
+  }
+
+  private case class LateralVectorSearchContext(
+      readBuilder: ReadBuilder,
+      vectorSearchBuilder: VectorSearchBuilder,
+      scoreMetadataColumns: Seq[PaimonMetadataColumn],
+      sparkRow: SparkInternalRow)
 }
