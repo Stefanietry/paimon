@@ -141,6 +141,79 @@ public class VectorReadImpl implements VectorRead, Serializable {
         return result.topK(limit);
     }
 
+    @Override
+    public List<GlobalIndexResult> readBatch(
+            List<float[]> vectors, List<VectorSearchSplit> splits) {
+        List<GlobalIndexResult> emptyResults = new ArrayList<>(vectors.size());
+        for (int i = 0; i < vectors.size(); i++) {
+            emptyResults.add(GlobalIndexResult.createEmpty());
+        }
+        if (vectors.isEmpty() || splits.isEmpty()) {
+            return emptyResults;
+        }
+
+        RoaringNavigableMap64 preFilter = preFilter(splits).orElse(null);
+
+        String indexType = splits.get(0).vectorIndexFiles().get(0).indexType();
+        GlobalIndexer globalIndexer =
+                GlobalIndexerFactoryUtils.load(indexType)
+                        .create(vectorColumn, table.coreOptions().toConfiguration());
+        IndexPathFactory indexPathFactory = table.store().pathFactory().globalIndexFileFactory();
+
+        int parallelism = table.coreOptions().toConfiguration().get(GLOBAL_INDEX_THREAD_NUM);
+        ExecutorService executor = GlobalIndexReadThreadPool.getExecutorService(parallelism);
+
+        List<ScoredGlobalIndexResult> scoredResults = new ArrayList<>(vectors.size());
+        for (int i = 0; i < vectors.size(); i++) {
+            scoredResults.add(ScoredGlobalIndexResult.createEmpty());
+        }
+
+        int maxInFlight = Math.max(1, parallelism);
+        List<CompletableFuture<List<Optional<ScoredGlobalIndexResult>>>> futures =
+                new ArrayList<>(maxInFlight);
+        for (VectorSearchSplit split : splits) {
+            futures.add(
+                    evalBatch(
+                            globalIndexer,
+                            indexPathFactory,
+                            split.rowRangeStart(),
+                            split.rowRangeEnd(),
+                            split.vectorIndexFiles(),
+                            preFilter,
+                            executor,
+                            vectors));
+            if (futures.size() >= maxInFlight) {
+                mergeBatchResults(scoredResults, futures);
+                futures.clear();
+            }
+        }
+        mergeBatchResults(scoredResults, futures);
+
+        List<GlobalIndexResult> results = new ArrayList<>(vectors.size());
+        for (ScoredGlobalIndexResult result : scoredResults) {
+            results.add(result.topK(limit));
+        }
+        return results;
+    }
+
+    private void mergeBatchResults(
+            List<ScoredGlobalIndexResult> scoredResults,
+            List<CompletableFuture<List<Optional<ScoredGlobalIndexResult>>>> futures) {
+        if (futures.isEmpty()) {
+            return;
+        }
+
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+        for (CompletableFuture<List<Optional<ScoredGlobalIndexResult>>> future : futures) {
+            List<Optional<ScoredGlobalIndexResult>> next = future.join();
+            for (int i = 0; i < next.size(); i++) {
+                if (next.get(i).isPresent()) {
+                    scoredResults.set(i, scoredResults.get(i).or(next.get(i).get()).topK(limit));
+                }
+            }
+        }
+    }
+
     protected Optional<RoaringNavigableMap64> preFilter(List<VectorSearchSplit> splits) {
         Set<IndexFileMeta> scalarIndexFiles =
                 new TreeSet<>(Comparator.comparing(IndexFileMeta::fileName));
@@ -187,6 +260,40 @@ public class VectorReadImpl implements VectorRead, Serializable {
                         .withIncludeRowIds(includeRowIds);
         return new OffsetGlobalIndexReader(reader, rowRangeStart, rowRangeEnd)
                 .visitVectorSearch(vectorSearch)
+                .whenComplete((r, t) -> IOUtils.closeQuietly(reader));
+    }
+
+    protected CompletableFuture<List<Optional<ScoredGlobalIndexResult>>> evalBatch(
+            GlobalIndexer globalIndexer,
+            IndexPathFactory indexPathFactory,
+            long rowRangeStart,
+            long rowRangeEnd,
+            List<IndexFileMeta> vectorIndexFiles,
+            @Nullable RoaringNavigableMap64 includeRowIds,
+            ExecutorService executor,
+            List<float[]> vectors) {
+        List<GlobalIndexIOMeta> indexIOMetaList = new ArrayList<>();
+        for (IndexFileMeta indexFile : vectorIndexFiles) {
+            GlobalIndexMeta meta = checkNotNull(indexFile.globalIndexMeta());
+            indexIOMetaList.add(
+                    new GlobalIndexIOMeta(
+                            indexPathFactory.toPath(indexFile),
+                            indexFile.fileSize(),
+                            meta.indexMeta()));
+        }
+        @SuppressWarnings("resource")
+        FileIO fileIO = table.fileIO();
+        GlobalIndexFileReader indexFileReader = m -> fileIO.newInputStream(m.filePath());
+        GlobalIndexReader reader =
+                globalIndexer.createReader(indexFileReader, indexIOMetaList, executor);
+        List<VectorSearch> vectorSearches = new ArrayList<>(vectors.size());
+        for (float[] searchVector : vectors) {
+            vectorSearches.add(
+                    new VectorSearch(searchVector, limit, vectorColumn.name(), options)
+                            .withIncludeRowIds(includeRowIds));
+        }
+        return new OffsetGlobalIndexReader(reader, rowRangeStart, rowRangeEnd)
+                .visitVectorSearchBatch(vectorSearches)
                 .whenComplete((r, t) -> IOUtils.closeQuietly(reader));
     }
 }

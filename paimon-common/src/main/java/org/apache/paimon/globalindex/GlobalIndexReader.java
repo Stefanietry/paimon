@@ -24,6 +24,7 @@ import org.apache.paimon.predicate.LeafPredicate;
 import org.apache.paimon.predicate.VectorSearch;
 
 import java.io.Closeable;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
@@ -53,6 +54,26 @@ public interface GlobalIndexReader
     default CompletableFuture<Optional<ScoredGlobalIndexResult>> visitVectorSearch(
             VectorSearch vectorSearch) {
         throw new UnsupportedOperationException();
+    }
+
+    default CompletableFuture<List<Optional<ScoredGlobalIndexResult>>> visitVectorSearchBatch(
+            List<VectorSearch> vectorSearches) {
+        List<CompletableFuture<Optional<ScoredGlobalIndexResult>>> futures =
+                new ArrayList<>(vectorSearches.size());
+        for (VectorSearch vectorSearch : vectorSearches) {
+            futures.add(visitVectorSearch(vectorSearch));
+        }
+        return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+                .thenApply(
+                        ignored -> {
+                            List<Optional<ScoredGlobalIndexResult>> results =
+                                    new ArrayList<>(futures.size());
+                            for (CompletableFuture<Optional<ScoredGlobalIndexResult>> future :
+                                    futures) {
+                                results.add(future.join());
+                            }
+                            return results;
+                        });
     }
 
     default CompletableFuture<Optional<ScoredGlobalIndexResult>> visitFullTextSearch(

@@ -30,6 +30,7 @@ import org.apache.paimon.globalindex.io.GlobalIndexFileReader;
 import org.apache.paimon.index.vector.VectorIndexInput;
 import org.apache.paimon.index.vector.VectorIndexMetadata;
 import org.apache.paimon.index.vector.VectorIndexReader;
+import org.apache.paimon.index.vector.VectorSearchBatchResult;
 import org.apache.paimon.index.vector.VectorSearchResult;
 import org.apache.paimon.predicate.FieldRef;
 import org.apache.paimon.predicate.VectorSearch;
@@ -107,6 +108,25 @@ public class VectorGlobalIndexReader implements GlobalIndexReader {
                 executor);
     }
 
+    @Override
+    public CompletableFuture<List<Optional<ScoredGlobalIndexResult>>> visitVectorSearchBatch(
+            List<VectorSearch> vectorSearches) {
+        return CompletableFuture.supplyAsync(
+                () -> {
+                    try {
+                        ensureLoaded();
+                        return searchBatch(vectorSearches);
+                    } catch (IOException e) {
+                        throw new RuntimeException(
+                                String.format(
+                                        "Failed batch vector index search: queryCount=%d",
+                                        vectorSearches.size()),
+                                e);
+                    }
+                },
+                executor);
+    }
+
     private ScoredGlobalIndexResult search(VectorSearch vectorSearch) throws IOException {
         validateSearchVector(vectorSearch.vector());
         float[] queryVector = vectorSearch.vector().clone();
@@ -130,9 +150,67 @@ public class VectorGlobalIndexReader implements GlobalIndexReader {
             result = vectorReader.search(queryVector, limit, nprobe, efSearch);
         }
 
-        long[] ids = result.ids();
-        float[] distances = result.distances();
+        return toScoredResult(result.ids(), result.distances(), metric);
+    }
 
+    private List<Optional<ScoredGlobalIndexResult>> searchBatch(List<VectorSearch> vectorSearches)
+            throws IOException {
+        List<Optional<ScoredGlobalIndexResult>> emptyResults =
+                new ArrayList<>(vectorSearches.size());
+        for (int i = 0; i < vectorSearches.size(); i++) {
+            emptyResults.add(Optional.empty());
+        }
+        if (vectorSearches.isEmpty()) {
+            return emptyResults;
+        }
+
+        VectorSearch firstSearch = vectorSearches.get(0);
+        int limit = firstSearch.limit();
+        int nprobe = nprobe(firstSearch.options());
+        int efSearch = efSearch(firstSearch.options());
+        String metric = nativeMeta.metric();
+        float[] queries = new float[vectorSearches.size() * nativeMeta.dimension()];
+        for (int i = 0; i < vectorSearches.size(); i++) {
+            float[] queryVector = vectorSearches.get(i).vector();
+            validateSearchVector(queryVector);
+            System.arraycopy(
+                    queryVector, 0, queries, i * nativeMeta.dimension(), queryVector.length);
+        }
+
+        RoaringNavigableMap64 includeRowIds = firstSearch.includeRowIds();
+        VectorSearchBatchResult result;
+        if (includeRowIds != null) {
+            long cardinality = includeRowIds.getLongCardinality();
+            if (cardinality == 0) {
+                return emptyResults;
+            }
+            byte[] filterBytes = includeRowIds.serialize();
+            int effectiveK = (int) Math.min(limit, cardinality);
+            result =
+                    vectorReader.searchBatch(
+                            queries,
+                            vectorSearches.size(),
+                            effectiveK,
+                            nprobe,
+                            efSearch,
+                            filterBytes);
+        } else {
+            result =
+                    vectorReader.searchBatch(
+                            queries, vectorSearches.size(), limit, nprobe, efSearch);
+        }
+
+        List<Optional<ScoredGlobalIndexResult>> results = new ArrayList<>(vectorSearches.size());
+        for (int i = 0; i < vectorSearches.size(); i++) {
+            results.add(
+                    Optional.ofNullable(
+                            toScoredResult(
+                                    result.idsForQuery(i), result.distancesForQuery(i), metric)));
+        }
+        return results;
+    }
+
+    private ScoredGlobalIndexResult toScoredResult(long[] ids, float[] distances, String metric) {
         if (ids.length == 0) {
             return null;
         }

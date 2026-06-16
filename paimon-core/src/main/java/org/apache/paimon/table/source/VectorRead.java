@@ -30,4 +30,6 @@ public interface VectorRead {
     }
 
     GlobalIndexResult read(List<VectorSearchSplit> splits);
+
+    List<GlobalIndexResult> readBatch(List<float[]> vectors, List<VectorSearchSplit> splits);
 }

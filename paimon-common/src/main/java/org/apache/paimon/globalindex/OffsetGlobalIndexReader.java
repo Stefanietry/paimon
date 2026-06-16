@@ -139,6 +139,25 @@ public class OffsetGlobalIndexReader implements GlobalIndexReader {
     }
 
     @Override
+    public CompletableFuture<List<Optional<ScoredGlobalIndexResult>>> visitVectorSearchBatch(
+            List<VectorSearch> vectorSearches) {
+        List<VectorSearch> offsetVectorSearches = new java.util.ArrayList<>(vectorSearches.size());
+        for (VectorSearch vectorSearch : vectorSearches) {
+            offsetVectorSearches.add(vectorSearch.offsetRange(this.offset, this.to));
+        }
+        return wrapped.visitVectorSearchBatch(offsetVectorSearches)
+                .thenApply(
+                        results -> {
+                            List<Optional<ScoredGlobalIndexResult>> offsetResults =
+                                    new java.util.ArrayList<>(results.size());
+                            for (Optional<ScoredGlobalIndexResult> result : results) {
+                                offsetResults.add(result.map(r -> r.offset(offset)));
+                            }
+                            return offsetResults;
+                        });
+    }
+
+    @Override
     public CompletableFuture<Optional<ScoredGlobalIndexResult>> visitFullTextSearch(
             FullTextSearch fullTextSearch) {
         return wrapped.visitFullTextSearch(fullTextSearch)

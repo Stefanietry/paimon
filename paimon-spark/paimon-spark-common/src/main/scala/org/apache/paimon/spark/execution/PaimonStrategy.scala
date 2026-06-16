@@ -18,6 +18,8 @@
 
 package org.apache.paimon.spark.execution
 
+import org.apache.paimon.CoreOptions
+import org.apache.paimon.globalindex.{GlobalIndexResult, ScoredGlobalIndexResult}
 import org.apache.paimon.partition.PartitionPredicate
 import org.apache.paimon.spark.{PaimonRecordReaderIterator, SparkCatalog, SparkGenericCatalog, SparkTable, SparkUtils}
 import org.apache.paimon.spark.catalog.{SparkBaseCatalog, SupportView}
@@ -25,9 +27,10 @@ import org.apache.paimon.spark.catalyst.analysis.ResolvedPaimonView
 import org.apache.paimon.spark.catalyst.plans.logical.{CopyIntoLocationCommand, CopyIntoLocationSource, CopyIntoTableCommand, CreateOrReplaceTagCommand, CreatePaimonView, DeleteTagCommand, DropPaimonView, LateralVectorSearch, PaimonCallCommand, PaimonDropPartitions, RenameTagCommand, ResolvedIdentifier, ShowPaimonViews, ShowTagsCommand, TruncatePaimonTableWithFilter}
 import org.apache.paimon.spark.data.SparkInternalRow
 import org.apache.paimon.spark.schema.PaimonMetadataColumn
-import org.apache.paimon.table.{InnerTable, Table}
-import org.apache.paimon.table.source.{InnerTableScan, ReadBuilder, VectorSearchBuilder}
+import org.apache.paimon.table.{InnerTable, SpecialFields, Table}
+import org.apache.paimon.table.source.{InnerTableScan, ReadBuilder, VectorScan, VectorSearchBuilder}
 import org.apache.paimon.types.RowType
+import org.apache.paimon.utils.RoaringNavigableMap64
 
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
@@ -43,6 +46,7 @@ import org.apache.spark.sql.execution.shim.{PaimonCreateTableAsSelectStrategy, P
 import org.apache.spark.sql.paimon.shims.SparkShimLoader
 
 import scala.collection.JavaConverters._
+import scala.collection.mutable.ArrayBuffer
 
 case class PaimonStrategy(spark: SparkSession)
   extends SparkStrategy
@@ -268,30 +272,49 @@ case class LateralVectorSearchExec(
         val queryVectorProjection = UnsafeProjection.create(Seq(strippedQueryExpr), child.output)
         val rightProjection = UnsafeProjection.create(projectList, vectorSearchOutput)
         val joinedRow = new JoinedRow
-        lazy val searchContext = createSearchContext()
+        lazy val searchContext = createSearchContext(rightProjection)
+        val batchSize = searchContext.batchSize
 
-        outerRows.flatMap {
-          outerRow =>
-            toFloatArray(queryVectorProjection(outerRow).get(0, strippedQueryExpr.dataType)) match {
-              case Some(queryVector) =>
-                search(queryVector, searchContext).map {
-                  rightRow =>
-                    joinedRow(outerRow, rightProjection(rightRow))
-                    joinedRow.copy()
-                }
-              case None => Iterator.empty
+        outerRows.grouped(batchSize).flatMap {
+          outerRowBatch =>
+            val searchBatch = ArrayBuffer[LateralVectorSearchQuery]()
+            outerRowBatch.foreach {
+              outerRow =>
+                toFloatArray(queryVectorProjection(outerRow).get(0, strippedQueryExpr.dataType))
+                  .foreach(
+                    queryVector => searchBatch += LateralVectorSearchQuery(outerRow, queryVector))
+            }
+
+            if (searchBatch.isEmpty) {
+              Iterator.empty
+            } else {
+              search(searchBatch, searchContext).map {
+                case (outerRow, rightRow) =>
+                  joinedRow(outerRow, rightRow)
+                  joinedRow.copy()
+              }
             }
         }
     }
   }
 
-  private def createSearchContext(): LateralVectorSearchContext = {
+  private def createSearchContext(rightProjection: UnsafeProjection): LateralVectorSearchContext = {
     val rowType = innerTable.rowType()
     val readFieldNames = vectorSearchOutput
       .filterNot(_.name == PaimonMetadataColumn.VECTOR_SEARCH_SCORE_COLUMN)
       .map(_.name)
+    val readFieldNamesWithRowId =
+      if (readFieldNames.contains(SpecialFields.ROW_ID.name())) {
+        readFieldNames
+      } else {
+        readFieldNames :+ SpecialFields.ROW_ID.name()
+      }
+    val rowTypeWithRowId = SpecialFields.rowTypeWithRowId(rowType)
     val readRowType = rowType.project(readFieldNames.asJava)
-    val readBuilder = innerTable.newReadBuilder().withReadType(readRowType)
+    val readRowTypeWithRowId = SpecialFields.rowTypeWithRowId(readRowType)
+    val readBuilder = innerTable
+      .newReadBuilder()
+      .withReadType(rowTypeWithRowId.project(readFieldNamesWithRowId.asJava))
     val scoreMetadataColumns =
       if (vectorSearchOutput.exists(_.name == PaimonMetadataColumn.VECTOR_SEARCH_SCORE_COLUMN)) {
         Seq(PaimonMetadataColumn.VECTOR_SEARCH_SCORE)
@@ -300,10 +323,11 @@ case class LateralVectorSearchExec(
       }
     val resultRowType =
       if (scoreMetadataColumns.isEmpty) {
-        readRowType
+        readRowTypeWithRowId
       } else {
         new RowType(
-          (readRowType.getFields.asScala ++ scoreMetadataColumns.map(_.toPaimonDataField)).asJava)
+          (readRowTypeWithRowId.getFields.asScala ++ scoreMetadataColumns.map(
+            _.toPaimonDataField)).asJava)
       }
     val sparkRow = SparkInternalRow.create(resultRowType)
     val vectorSearchBuilder = innerTable
@@ -311,16 +335,43 @@ case class LateralVectorSearchExec(
       .withVectorColumn(columnName)
       .withLimit(limit)
 
-    LateralVectorSearchContext(readBuilder, vectorSearchBuilder, scoreMetadataColumns, sparkRow)
+    val vectorPlan = vectorSearchBuilder.newVectorScan().scan()
+    val batchSize =
+      Math.max(1, new CoreOptions(innerTable.options()).vectorSearchLateralJoinBatchSize())
+
+    LateralVectorSearchContext(
+      readBuilder,
+      vectorSearchBuilder,
+      vectorPlan,
+      scoreMetadataColumns,
+      sparkRow,
+      rowIdOrdinal = resultRowType.getFieldIndex(SpecialFields.ROW_ID.name()),
+      projectionInputOrdinals = vectorSearchOutput.map {
+        attr =>
+          if (attr.name == PaimonMetadataColumn.VECTOR_SEARCH_SCORE_COLUMN) {
+            -1
+          } else {
+            resultRowType.getFieldIndex(attr.name)
+          }
+      },
+      rightProjection,
+      batchSize
+    )
   }
 
   private def search(
-      queryVector: Array[Float],
-      context: LateralVectorSearchContext): Iterator[InternalRow] = {
-    val globalIndexResult = context.vectorSearchBuilder.withVector(queryVector).executeLocal()
+      queries: Seq[LateralVectorSearchQuery],
+      context: LateralVectorSearchContext): Iterator[(InternalRow, InternalRow)] = {
+    val vectors = queries.map(_.queryVector).asJava
+    val globalIndexResults = context.vectorSearchBuilder
+      .newVectorRead()
+      .readBatch(vectors, context.vectorPlan.splits())
+      .asScala
+    val rowIdToMatches = createRowIdToMatches(queries, globalIndexResults)
+    val batchGlobalIndexResult = createBatchGlobalIndexResult(globalIndexResults)
     val scan = context.readBuilder
       .newScan()
-      .withGlobalIndexResult(globalIndexResult)
+      .withGlobalIndexResult(batchGlobalIndexResult)
       .asInstanceOf[InnerTableScan]
     val read = context.readBuilder.newRead()
 
@@ -328,7 +379,7 @@ case class LateralVectorSearchExec(
       split =>
         val reader =
           PaimonRecordReaderIterator(read.createReader(split), context.scoreMetadataColumns, split)
-        new Iterator[InternalRow] {
+        new Iterator[Iterator[(InternalRow, InternalRow)]] {
           private var closed = false
 
           override def hasNext: Boolean = {
@@ -340,10 +391,79 @@ case class LateralVectorSearchExec(
             hasNext
           }
 
-          override def next(): InternalRow = {
-            context.sparkRow.replace(reader.next()).copy()
+          override def next(): Iterator[(InternalRow, InternalRow)] = {
+            val rightRow = context.sparkRow.replace(reader.next()).copy()
+            val rowId = rightRow.getLong(context.rowIdOrdinal)
+            rowIdToMatches.getOrElse(rowId, Seq.empty).iterator.map {
+              searchMatch =>
+                val projectedRow = projectRightRow(rightRow, searchMatch, context)
+                (searchMatch.outerRow, projectedRow)
+            }
           }
+        }.flatMap(identity)
+    }
+  }
+
+  private def projectRightRow(
+      rightRow: InternalRow,
+      searchMatch: LateralVectorSearchMatch,
+      context: LateralVectorSearchContext): InternalRow = {
+    val values = new Array[Any](vectorSearchOutput.size)
+    vectorSearchOutput.zipWithIndex.foreach {
+      case (attr, index) =>
+        val ordinal = context.projectionInputOrdinals(index)
+        values(index) = if (ordinal < 0) {
+          searchMatch.score
+        } else {
+          rightRow.get(ordinal, attr.dataType)
         }
+    }
+    context.rightProjection(new GenericInternalRow(values)).copy()
+  }
+
+  private def createRowIdToMatches(
+      queries: Seq[LateralVectorSearchQuery],
+      globalIndexResults: Seq[GlobalIndexResult]): Map[Long, Seq[LateralVectorSearchMatch]] = {
+    val rowIdToMatches =
+      scala.collection.mutable.LinkedHashMap[Long, ArrayBuffer[LateralVectorSearchMatch]]()
+    queries.zip(globalIndexResults).foreach {
+      case (query, result) =>
+        val scoreGetter = result match {
+          case scored: ScoredGlobalIndexResult => Some(scored.scoreGetter())
+          case _ => None
+        }
+        result.results().iterator().asScala.foreach {
+          rowId =>
+            rowIdToMatches.getOrElseUpdate(rowId, ArrayBuffer()) +=
+              LateralVectorSearchMatch(
+                query.outerRow.copy(),
+                scoreGetter.map(_.score(rowId)).getOrElse(Float.NaN))
+        }
+    }
+    rowIdToMatches.mapValues(_.toSeq).toMap
+  }
+
+  private def createBatchGlobalIndexResult(
+      globalIndexResults: Seq[GlobalIndexResult]): GlobalIndexResult = {
+    val rowIds = new RoaringNavigableMap64()
+    val rowIdToScore = scala.collection.mutable.HashMap[Long, Float]()
+    globalIndexResults.foreach {
+      result =>
+        rowIds.or(result.results())
+        result match {
+          case scored: ScoredGlobalIndexResult =>
+            result
+              .results()
+              .iterator()
+              .asScala
+              .foreach(rowId => rowIdToScore.put(rowId, scored.scoreGetter().score(rowId)))
+          case _ =>
+        }
+    }
+    if (rowIdToScore.isEmpty) {
+      GlobalIndexResult.create(rowIds)
+    } else {
+      ScoredGlobalIndexResult.create(rowIds, rowId => rowIdToScore.getOrElse(rowId, Float.NaN))
     }
   }
 
@@ -359,6 +479,15 @@ case class LateralVectorSearchExec(
   private case class LateralVectorSearchContext(
       readBuilder: ReadBuilder,
       vectorSearchBuilder: VectorSearchBuilder,
+      vectorPlan: VectorScan.Plan,
       scoreMetadataColumns: Seq[PaimonMetadataColumn],
-      sparkRow: SparkInternalRow)
+      sparkRow: SparkInternalRow,
+      rowIdOrdinal: Int,
+      projectionInputOrdinals: Seq[Int],
+      rightProjection: UnsafeProjection,
+      batchSize: Int)
+
+  private case class LateralVectorSearchQuery(outerRow: InternalRow, queryVector: Array[Float])
+
+  private case class LateralVectorSearchMatch(outerRow: InternalRow, score: Float)
 }
