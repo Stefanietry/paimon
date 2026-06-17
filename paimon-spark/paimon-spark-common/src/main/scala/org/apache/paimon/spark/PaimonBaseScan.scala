@@ -18,22 +18,25 @@
 
 package org.apache.paimon.spark
 
-import org.apache.paimon.CoreOptions
-import org.apache.paimon.globalindex.GlobalIndexResult
+import org.apache.paimon.globalindex.{GlobalIndexResult, ScoredGlobalIndexResult, ScoreGetter}
 import org.apache.paimon.partition.PartitionPredicate
-import org.apache.paimon.predicate.PredicateBuilder
+import org.apache.paimon.predicate.{FullTextSearch, Predicate, PredicateBuilder, VectorSearch}
 import org.apache.paimon.spark.metric.SparkMetricRegistry
 import org.apache.paimon.spark.read.{BaseScan, BatchReadTagCleanupListener, PaimonSupportsRuntimeFiltering, SparkVectorSearchBuilderImpl}
+import org.apache.paimon.spark.schema.PaimonMetadataColumn
 import org.apache.paimon.spark.sources.PaimonMicroBatchStream
 import org.apache.paimon.spark.util.OptionUtils
 import org.apache.paimon.table.{DataTable, FileStoreTable, InnerTable}
 import org.apache.paimon.table.source.{DataTableBatchScan, InnerTableScan, Split}
 
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.SQLConfHelper
+import org.apache.spark.sql.catalyst.expressions.GenericInternalRow
 import org.apache.spark.sql.connector.metric.{CustomMetric, CustomTaskMetric}
 import org.apache.spark.sql.connector.read.Batch
 import org.apache.spark.sql.connector.read.streaming.MicroBatchStream
+import org.apache.spark.sql.types.StructType
 
 import scala.collection.JavaConverters._
 
@@ -78,25 +81,12 @@ abstract class PaimonBaseScan(table: InnerTable)
   }
 
   private def evalVectorSearch(): GlobalIndexResult = {
-    val vectorSearch = pushedVectorSearch.get
-    val vectorSearchBuilder =
-      if (CoreOptions.fromMap(table.options).vectorSearchDistributeEnabled()) {
-        new SparkVectorSearchBuilderImpl(table)
-      } else {
-        table.newVectorSearchBuilder()
-      }
-    val vectorBuilder = vectorSearchBuilder
-      .withVector(vectorSearch.vector())
-      .withVectorColumn(vectorSearch.fieldName())
-      .withLimit(vectorSearch.limit())
-      .withOptions(vectorSearch.options())
-    if (pushedPartitionFilters.nonEmpty) {
-      vectorBuilder.withPartitionFilter(PartitionPredicate.and(pushedPartitionFilters.asJava))
-    }
-    if (pushedDataFilters.nonEmpty) {
-      vectorBuilder.withFilter(PredicateBuilder.and(pushedDataFilters.asJava))
-    }
-    vectorBuilder.newVectorRead().read(vectorBuilder.newVectorScan().scan())
+    PaimonBaseScan.evalVectorSearch(
+      table,
+      pushedVectorSearch.get,
+      pushedPartitionFilters,
+      pushedDataFilters,
+      coreOptions.vectorSearchDistributeEnabled())
   }
 
   private def evalFullTextSearch(): GlobalIndexResult = {
@@ -147,5 +137,80 @@ abstract class PaimonBaseScan(table: InnerTable)
         }
       case _ =>
     }
+  }
+}
+
+object PaimonBaseScan {
+
+  def evalVectorSearch(
+      table: InnerTable,
+      vectorSearch: VectorSearch,
+      pushedPartitionFilters: Seq[PartitionPredicate],
+      pushedDataFilters: Seq[Predicate],
+      vectorSearchDistributeEnabled: Boolean): GlobalIndexResult = {
+    val vectorSearchBuilder =
+      if (vectorSearchDistributeEnabled) {
+        new SparkVectorSearchBuilderImpl(table)
+      } else {
+        table.newVectorSearchBuilder()
+      }
+    val vectorBuilder = vectorSearchBuilder
+      .withVector(vectorSearch.vector())
+      .withVectorColumn(vectorSearch.fieldName())
+      .withLimit(vectorSearch.limit())
+      .withOptions(vectorSearch.options())
+    if (pushedPartitionFilters.nonEmpty) {
+      vectorBuilder.withPartitionFilter(PartitionPredicate.and(pushedPartitionFilters.asJava))
+    }
+    if (pushedDataFilters.nonEmpty) {
+      vectorBuilder.withFilter(PredicateBuilder.and(pushedDataFilters.asJava))
+    }
+    vectorBuilder.executeLocal()
+  }
+
+  def canSkipVectorSearchBackLookup(
+      requiredSchema: StructType,
+      vectorSearch: Option[VectorSearch],
+      fullTextSearch: Option[FullTextSearch]): Boolean = {
+    vectorSearch.isDefined && fullTextSearch.isEmpty && requiredSchema.fields.forall {
+      field => isVectorSearchMetadataColumn(field.name)
+    }
+  }
+
+  def isVectorSearchMetadataColumn(name: String): Boolean = {
+    name == PaimonMetadataColumn.ROW_ID_COLUMN ||
+    name == PaimonMetadataColumn.VECTOR_SEARCH_SCORE_COLUMN
+  }
+
+  def vectorSearchMetadataRows(
+      requiredSchema: StructType,
+      result: GlobalIndexResult): Array[InternalRow] = {
+    val fieldNames = requiredSchema.fields.map(_.name)
+    val scoreGetter = result match {
+      case scored: ScoredGlobalIndexResult => scored.scoreGetter()
+      case _ => null
+    }
+    result
+      .results()
+      .iterator()
+      .asScala
+      .map {
+        rowId =>
+          val values = new Array[Any](fieldNames.length)
+          var i = 0
+          while (i < fieldNames.length) {
+            values(i) = fieldNames(i) match {
+              case PaimonMetadataColumn.ROW_ID_COLUMN => rowId
+              case PaimonMetadataColumn.VECTOR_SEARCH_SCORE_COLUMN => score(rowId, scoreGetter)
+            }
+            i += 1
+          }
+          new GenericInternalRow(values).asInstanceOf[InternalRow]
+      }
+      .toArray
+  }
+
+  private def score(rowId: Long, scoreGetter: ScoreGetter): Float = {
+    if (scoreGetter == null) Float.NaN else scoreGetter.score(rowId)
   }
 }

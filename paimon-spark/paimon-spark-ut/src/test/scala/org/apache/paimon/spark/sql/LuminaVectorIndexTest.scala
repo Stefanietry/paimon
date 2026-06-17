@@ -20,6 +20,8 @@ package org.apache.paimon.spark.sql
 
 import org.apache.paimon.spark.PaimonSparkTestBase
 
+import org.apache.spark.sql.Row
+
 import scala.collection.JavaConverters._
 
 /** Tests for Lumina vector index read/write operations. */
@@ -113,6 +115,39 @@ class LuminaVectorIndexTest extends PaimonSparkTestBase {
                |""".stripMargin)
         .collect()
       assert(result.length == 5)
+
+      val metadataOnlyExplain = spark
+        .sql("""
+               |EXPLAIN
+               |SELECT _ROW_ID, __paimon_vector_search_score
+               |FROM vector_search('T', 'v', array(50.0f, 51.0f, 52.0f), 5)
+               |""".stripMargin)
+        .collect()
+        .mkString("\n")
+      assert(metadataOnlyExplain.contains("PaimonLocalScan"))
+
+      val metadataOnlyResult = spark
+        .sql("""
+               |SELECT _ROW_ID, __paimon_vector_search_score
+               |FROM vector_search('T', 'v', array(50.0f, 51.0f, 52.0f), 5)
+               |""".stripMargin)
+        .collect()
+      assert(metadataOnlyResult.length == 5)
+      assert(metadataOnlyResult.exists(_.getLong(0) == 50L))
+      assert(metadataOnlyResult.forall(!_.isNullAt(1)))
+
+      checkAnswer(
+        spark.sql("""
+                    |SELECT q.id, r._ROW_ID
+                    |FROM T AS q
+                    |INNER JOIN LATERAL (
+                    |  SELECT _ROW_ID, __paimon_vector_search_score
+                    |  FROM vector_search('T', 'v', q.v, 1)
+                    |) AS r
+                    |WHERE q.id = 50
+                    |""".stripMargin),
+        Seq(Row(50, 50L))
+      )
     }
   }
 

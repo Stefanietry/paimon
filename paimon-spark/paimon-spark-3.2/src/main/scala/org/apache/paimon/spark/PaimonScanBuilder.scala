@@ -18,6 +18,7 @@
 
 package org.apache.paimon.spark
 
+import org.apache.paimon.spark.read.PaimonLocalScan
 import org.apache.paimon.table.InnerTable
 
 import org.apache.spark.sql.connector.read.Scan
@@ -38,6 +39,23 @@ class PaimonScanBuilder(val table: InnerTable) extends PaimonBaseScanBuilder {
         (ftst.origin(), None, Option(ftst.fullTextSearch()))
       case _ => (table, pushedVectorSearch, pushedFullTextSearch)
     }
+
+    if (
+      PaimonBaseScan.canSkipVectorSearchBackLookup(requiredSchema, vectorSearch, fullTextSearch)
+    ) {
+      val result = PaimonBaseScan.evalVectorSearch(
+        actualTable,
+        vectorSearch.get,
+        pushedPartitionFilters.toSeq,
+        pushedDataFilters.toSeq,
+        coreOptions.vectorSearchDistributeEnabled())
+      return PaimonLocalScan(
+        PaimonBaseScan.vectorSearchMetadataRows(requiredSchema, result),
+        requiredSchema,
+        actualTable,
+        pushedPartitionFilters)
+    }
+
     PaimonScan(
       actualTable,
       requiredSchema,

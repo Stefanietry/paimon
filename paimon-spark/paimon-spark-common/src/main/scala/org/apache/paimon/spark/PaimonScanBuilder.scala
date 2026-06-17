@@ -143,6 +143,22 @@ class PaimonScanBuilder(val table: InnerTable)
           case _ => (table, pushedVectorSearch, pushedFullTextSearch)
         }
 
+        if (
+          PaimonBaseScan.canSkipVectorSearchBackLookup(requiredSchema, vectorSearch, fullTextSearch)
+        ) {
+          val result = PaimonBaseScan.evalVectorSearch(
+            actualTable,
+            vectorSearch.get,
+            pushedPartitionFilters.toSeq,
+            pushedDataFilters.toSeq,
+            coreOptions.vectorSearchDistributeEnabled())
+          return PaimonLocalScan(
+            PaimonBaseScan.vectorSearchMetadataRows(requiredSchema, result),
+            requiredSchema,
+            actualTable,
+            pushedPartitionFilters)
+        }
+
         PaimonScan(
           actualTable,
           requiredSchema,

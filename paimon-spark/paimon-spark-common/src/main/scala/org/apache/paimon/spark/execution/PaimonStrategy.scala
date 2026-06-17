@@ -329,7 +329,7 @@ case class LateralVectorSearchExec(
   private def createSearchContext(rightProjection: UnsafeProjection): LateralVectorSearchContext = {
     val rowType = innerTable.rowType()
     val readFieldNames = vectorSearchOutput
-      .filterNot(_.name == PaimonMetadataColumn.VECTOR_SEARCH_SCORE_COLUMN)
+      .filterNot(attr => vectorSearchMetadataColumn(attr.name))
       .map(_.name)
     val readFieldNamesWithRowId =
       if (readFieldNames.contains(SpecialFields.ROW_ID.name())) {
@@ -383,7 +383,8 @@ case class LateralVectorSearchExec(
           }
       },
       rightProjection,
-      batchSize
+      batchSize,
+      canSkipBackLookup = vectorSearchOutput.forall(attr => vectorSearchMetadataColumn(attr.name))
     )
   }
 
@@ -402,6 +403,11 @@ case class LateralVectorSearchExec(
         s"queries: ${queries.size}, " +
         s"elapsed time: $vectorSearchElapsedSeconds s.")
     val rowIdToMatches = createRowIdToMatches(queries, globalIndexResults)
+    if (context.canSkipBackLookup) {
+      return rowIdToMatches.valuesIterator.flatten.map {
+        searchMatch => (searchMatch.outerRow, projectMetadataRow(searchMatch, context))
+      }
+    }
     val batchGlobalIndexResult = createBatchGlobalIndexResult(globalIndexResults)
     val scan = context.readBuilder
       .newScan()
@@ -455,6 +461,20 @@ case class LateralVectorSearchExec(
     context.rightProjection(new GenericInternalRow(values)).copy()
   }
 
+  private def projectMetadataRow(
+      searchMatch: LateralVectorSearchMatch,
+      context: LateralVectorSearchContext): InternalRow = {
+    val values = new Array[Any](vectorSearchOutput.size)
+    vectorSearchOutput.zipWithIndex.foreach {
+      case (attr, index) =>
+        values(index) = attr.name match {
+          case PaimonMetadataColumn.ROW_ID_COLUMN => searchMatch.rowId
+          case PaimonMetadataColumn.VECTOR_SEARCH_SCORE_COLUMN => searchMatch.score
+        }
+    }
+    context.rightProjection(new GenericInternalRow(values)).copy()
+  }
+
   private def createRowIdToMatches(
       queries: Seq[LateralVectorSearchQuery],
       globalIndexResults: Seq[GlobalIndexResult]): Map[Long, Seq[LateralVectorSearchMatch]] = {
@@ -470,6 +490,7 @@ case class LateralVectorSearchExec(
           rowId =>
             rowIdToMatches.getOrElseUpdate(rowId, ArrayBuffer()) +=
               LateralVectorSearchMatch(
+                rowId,
                 query.outerRow.copy(),
                 scoreGetter.map(_.score(rowId)).getOrElse(Float.NaN))
         }
@@ -510,6 +531,11 @@ case class LateralVectorSearchExec(
     }
   }
 
+  private def vectorSearchMetadataColumn(name: String): Boolean = {
+    name == PaimonMetadataColumn.ROW_ID_COLUMN ||
+    name == PaimonMetadataColumn.VECTOR_SEARCH_SCORE_COLUMN
+  }
+
   private case class LateralVectorSearchContext(
       readBuilder: ReadBuilder,
       vectorSearchBuilder: VectorSearchBuilder,
@@ -519,9 +545,10 @@ case class LateralVectorSearchExec(
       rowIdOrdinal: Int,
       projectionInputOrdinals: Seq[Int],
       rightProjection: UnsafeProjection,
-      batchSize: Int)
+      batchSize: Int,
+      canSkipBackLookup: Boolean)
 
   private case class LateralVectorSearchQuery(outerRow: InternalRow, queryVector: Array[Float])
 
-  private case class LateralVectorSearchMatch(outerRow: InternalRow, score: Float)
+  private case class LateralVectorSearchMatch(rowId: Long, outerRow: InternalRow, score: Float)
 }
