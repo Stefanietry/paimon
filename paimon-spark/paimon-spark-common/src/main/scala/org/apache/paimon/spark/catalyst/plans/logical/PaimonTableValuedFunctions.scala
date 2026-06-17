@@ -835,7 +835,7 @@ case class DynamicVectorSearchRelation(
 
   private lazy val outputWithScore: Seq[Attribute] =
     relationOutput ++
-      Seq(PaimonMetadataColumn.SEARCH_SCORE.toAttribute)
+      Seq(PaimonMetadataColumn.ROW_ID.toAttribute, PaimonMetadataColumn.SEARCH_SCORE.toAttribute)
 
   override def output: Seq[Attribute] = outputWithScore
 }
