@@ -32,6 +32,8 @@ import org.apache.paimon.table.source.{InnerTableScan, ReadBuilder, VectorScan, 
 import org.apache.paimon.types.RowType
 import org.apache.paimon.utils.RoaringNavigableMap64
 
+import org.apache.spark.TaskContext
+import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
@@ -246,7 +248,8 @@ case class LateralVectorSearchExec(
     projectList: Seq[NamedExpression],
     projectOutput: Seq[Attribute],
     child: SparkPlan)
-  extends SparkPlan {
+  extends SparkPlan
+  with Logging {
 
   override def children: Seq[SparkPlan] = Seq(child)
 
@@ -274,9 +277,25 @@ case class LateralVectorSearchExec(
         val joinedRow = new JoinedRow
         lazy val searchContext = createSearchContext(rightProjection)
         val batchSize = searchContext.batchSize
+        var batchNumber = 0L
+        var totalOuterRowCount = 0L
+        var totalQueryCount = 0L
+        val totalStartMillis = System.currentTimeMillis()
+        Option(TaskContext.get()).foreach(_.addTaskCompletionListener[Unit] {
+          _ =>
+            val totalElapsedSeconds = (System.currentTimeMillis() - totalStartMillis) / 1000.0
+            logInfo(
+              s"Finished lateral vector search, " +
+                s"batches: $batchNumber, " +
+                s"outer rows: $totalOuterRowCount, " +
+                s"query vectors: $totalQueryCount, " +
+                s"elapsed time: $totalElapsedSeconds s.")
+        })
 
         outerRows.grouped(batchSize).flatMap {
           outerRowBatch =>
+            batchNumber += 1
+            val startMillis = System.currentTimeMillis()
             val searchBatch = ArrayBuffer[LateralVectorSearchQuery]()
             outerRowBatch.foreach {
               outerRow =>
@@ -284,8 +303,10 @@ case class LateralVectorSearchExec(
                   .foreach(
                     queryVector => searchBatch += LateralVectorSearchQuery(outerRow, queryVector))
             }
+            totalOuterRowCount += outerRowBatch.size
+            totalQueryCount += searchBatch.size
 
-            if (searchBatch.isEmpty) {
+            val resultIterator = if (searchBatch.isEmpty) {
               Iterator.empty
             } else {
               search(searchBatch, searchContext).map {
@@ -294,6 +315,13 @@ case class LateralVectorSearchExec(
                   joinedRow.copy()
               }
             }
+            val elapsedSeconds = (System.currentTimeMillis() - startMillis) / 1000.0
+            logInfo(
+              s"Finished lateral vector search batch $batchNumber, " +
+                s"outer rows: ${outerRowBatch.size}, " +
+                s"query vectors: ${searchBatch.size}, " +
+                s"elapsed time: $elapsedSeconds s.")
+            resultIterator
         }
     }
   }
@@ -363,10 +391,16 @@ case class LateralVectorSearchExec(
       queries: Seq[LateralVectorSearchQuery],
       context: LateralVectorSearchContext): Iterator[(InternalRow, InternalRow)] = {
     val vectors = queries.map(_.queryVector).asJava
+    val vectorSearchStartMillis = System.currentTimeMillis()
     val globalIndexResults = context.vectorSearchBuilder
       .newVectorRead()
       .readBatch(vectors, context.vectorPlan.splits())
       .asScala
+    val vectorSearchElapsedSeconds = (System.currentTimeMillis() - vectorSearchStartMillis) / 1000.0
+    logInfo(
+      s"Finished lateral vector search read batch, " +
+        s"queries: ${queries.size}, " +
+        s"elapsed time: $vectorSearchElapsedSeconds s.")
     val rowIdToMatches = createRowIdToMatches(queries, globalIndexResults)
     val batchGlobalIndexResult = createBatchGlobalIndexResult(globalIndexResults)
     val scan = context.readBuilder
