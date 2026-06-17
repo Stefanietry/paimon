@@ -22,7 +22,7 @@ import org.apache.paimon.data.{BinaryString, GenericRow, InternalRow => PaimonIn
 import org.apache.paimon.fs.Path
 import org.apache.paimon.reader.{FileRecordIterator, RecordReader, ScoreRecordIterator}
 import org.apache.paimon.spark.schema.PaimonMetadataColumn
-import org.apache.paimon.spark.schema.PaimonMetadataColumn.{PARTITION_AND_BUCKET_META_COLUMNS, PATH_AND_INDEX_META_COLUMNS, SEARCH_SCORE_COLUMN}
+import org.apache.paimon.spark.schema.PaimonMetadataColumn.{PARTITION_AND_BUCKET_META_COLUMNS, PATH_AND_INDEX_META_COLUMNS, ROW_ID_COLUMN, SEARCH_SCORE_COLUMN}
 import org.apache.paimon.table.source.{DataSplit, Split}
 import org.apache.paimon.utils.{CloseableIterator, Preconditions}
 
@@ -51,7 +51,9 @@ case class PaimonRecordReaderIterator(
   private val needScoreMetadata = {
     metadataColumns.exists(_.name == SEARCH_SCORE_COLUMN)
   }
-  Preconditions.checkArgument(!needScoreMetadata || metadataColumns.size == 1)
+  Preconditions.checkArgument(
+    !needScoreMetadata ||
+      metadataColumns.forall(c => c.name == ROW_ID_COLUMN || c.name == SEARCH_SCORE_COLUMN))
 
   private val metadataRow: GenericRow =
     GenericRow.of(Array.fill(metadataColumns.size)(null.asInstanceOf[AnyRef]): _*)
@@ -179,6 +181,8 @@ case class PaimonRecordReaderIterator(
     metadataColumns.zipWithIndex.foreach {
       case (metadataColumn, index) =>
         metadataColumn.name match {
+          case PaimonMetadataColumn.ROW_ID_COLUMN =>
+            metadataRow.setField(index, fileRecordIterator.returnedRowId())
           case PaimonMetadataColumn.SEARCH_SCORE_COLUMN =>
             metadataRow.setField(index, fileRecordIterator.returnedScore())
         }

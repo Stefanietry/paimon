@@ -178,6 +178,30 @@ class TableValuedFunctionsTest extends PaimonHiveTestBase {
       assert(
         !constantVectorPlan.exists(_.isInstanceOf[LateralVectorSearch]),
         constantVectorPlan.toString)
+
+      val optimizedPlanWithRowIdAndScore = spark
+        .sql("""
+               |SELECT q.gid AS query_gid, r._ROW_ID AS row_id, r.__paimon_search_score AS score
+               |FROM vector_search_source AS q,
+               |LATERAL (
+               |  SELECT _ROW_ID, __paimon_search_score
+               |  FROM vector_search('vector_search_source', 'embs', q.embs, 5)
+               |) AS r
+               |WHERE q.dt = '20260608'
+               |""".stripMargin)
+        .queryExecution
+        .optimizedPlan
+      val lateralVectorSearchesWithRowIdAndScore = optimizedPlanWithRowIdAndScore.collect {
+        case lvs: LateralVectorSearch => lvs
+      }
+      assert(
+        lateralVectorSearchesWithRowIdAndScore.size == 1,
+        optimizedPlanWithRowIdAndScore.toString)
+      assert(
+        lateralVectorSearchesWithRowIdAndScore.head.vectorSearchOutput.map(_.name) ==
+          Seq("_ROW_ID", "__paimon_search_score"),
+        optimizedPlanWithRowIdAndScore.toString
+      )
     }
   }
 
