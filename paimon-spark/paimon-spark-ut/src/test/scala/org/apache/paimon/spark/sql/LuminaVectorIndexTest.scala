@@ -148,6 +148,22 @@ class LuminaVectorIndexTest extends PaimonSparkTestBase {
                     |""".stripMargin),
         Seq(Row(50, 50L))
       )
+
+      val lateralRows = spark
+        .sql("""
+               |SELECT q.id, r._ROW_ID, r.__paimon_vector_search_score
+               |FROM T AS q
+               |INNER JOIN LATERAL (
+               |  SELECT _ROW_ID, __paimon_vector_search_score
+               |  FROM vector_search('T', 'v', q.v, 1)
+               |) AS r
+               |WHERE q.id IN (1, 3, 5, 7)
+               |ORDER BY q.id
+               |""".stripMargin)
+        .collect()
+      assert(lateralRows.map(_.getInt(0)).toSeq == Seq(1, 3, 5, 7))
+      assert(lateralRows.forall(!_.isNullAt(1)))
+      assert(lateralRows.forall(!_.isNullAt(2)))
     }
   }
 

@@ -292,7 +292,10 @@ case class LateralVectorSearchExec(
                 s"elapsed time: $totalElapsedSeconds s.")
         })
 
-        outerRows.grouped(batchSize).flatMap {
+        // Spark input iterators may reuse the same mutable InternalRow instance for every record.
+        // Copy rows before grouping, otherwise a whole batch can hold references to the final
+        // input row and all lateral search results will be joined with that row.
+        outerRows.map(_.copy()).grouped(batchSize).flatMap {
           outerRowBatch =>
             batchNumber += 1
             val startMillis = System.currentTimeMillis()
@@ -432,7 +435,7 @@ case class LateralVectorSearchExec(
           }
 
           override def next(): Iterator[(InternalRow, InternalRow)] = {
-            val rightRow = context.sparkRow.replace(reader.next()).copy()
+            val rightRow = context.sparkRow.replace(reader.next())
             val rowId = rightRow.getLong(context.rowIdOrdinal)
             rowIdToMatches.getOrElse(rowId, Seq.empty).iterator.map {
               searchMatch =>
@@ -458,7 +461,7 @@ case class LateralVectorSearchExec(
           rightRow.get(ordinal, attr.dataType)
         }
     }
-    context.rightProjection(new GenericInternalRow(values)).copy()
+    context.rightProjection(new GenericInternalRow(values))
   }
 
   private def projectMetadataRow(
@@ -472,7 +475,7 @@ case class LateralVectorSearchExec(
           case PaimonMetadataColumn.VECTOR_SEARCH_SCORE_COLUMN => searchMatch.score
         }
     }
-    context.rightProjection(new GenericInternalRow(values)).copy()
+    context.rightProjection(new GenericInternalRow(values))
   }
 
   private def createRowIdToMatches(
@@ -491,7 +494,7 @@ case class LateralVectorSearchExec(
             rowIdToMatches.getOrElseUpdate(rowId, ArrayBuffer()) +=
               LateralVectorSearchMatch(
                 rowId,
-                query.outerRow.copy(),
+                query.outerRow,
                 scoreGetter.map(_.score(rowId)).getOrElse(Float.NaN))
         }
     }
