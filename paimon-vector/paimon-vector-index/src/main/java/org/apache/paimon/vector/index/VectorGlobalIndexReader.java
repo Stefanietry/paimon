@@ -41,6 +41,9 @@ import org.apache.paimon.types.VectorType;
 import org.apache.paimon.utils.IOUtils;
 import org.apache.paimon.utils.RoaringNavigableMap64;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -60,6 +63,8 @@ import static org.apache.paimon.utils.Preconditions.checkArgument;
  * vector similarity search.
  */
 public class VectorGlobalIndexReader implements GlobalIndexReader {
+
+    private static final Logger LOG = LoggerFactory.getLogger(VectorGlobalIndexReader.class);
 
     private static final String NPROBE_PARAMETER = "ivf.nprobe";
     private static final String EF_SEARCH_PARAMETER = "hnsw.ef_search";
@@ -155,6 +160,7 @@ public class VectorGlobalIndexReader implements GlobalIndexReader {
 
     private List<Optional<ScoredGlobalIndexResult>> searchBatch(List<VectorSearch> vectorSearches)
             throws IOException {
+        long searchStartTime = System.currentTimeMillis();
         List<Optional<ScoredGlobalIndexResult>> emptyResults =
                 new ArrayList<>(vectorSearches.size());
         for (int i = 0; i < vectorSearches.size(); i++) {
@@ -179,6 +185,10 @@ public class VectorGlobalIndexReader implements GlobalIndexReader {
 
         RoaringNavigableMap64 includeRowIds = firstSearch.includeRowIds();
         VectorSearchBatchResult result;
+        LOG.info(
+                "Batch search with {} queries, includeRowIds is null:{}",
+                vectorSearches.size(),
+                includeRowIds == null);
         if (includeRowIds != null) {
             long cardinality = includeRowIds.getLongCardinality();
             if (cardinality == 0) {
@@ -207,6 +217,8 @@ public class VectorGlobalIndexReader implements GlobalIndexReader {
                             toScoredResult(
                                     result.idsForQuery(i), result.distancesForQuery(i), metric)));
         }
+        long cost = (System.currentTimeMillis() - searchStartTime) / 1000;
+        LOG.info("Finish batch search with {} queries， cost:{}", vectorSearches.size(), cost);
         return results;
     }
 

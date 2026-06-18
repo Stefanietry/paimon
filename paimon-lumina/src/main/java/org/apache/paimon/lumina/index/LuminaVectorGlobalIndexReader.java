@@ -34,6 +34,8 @@ import org.apache.paimon.utils.IOUtils;
 import org.apache.paimon.utils.RoaringNavigableMap64;
 
 import org.aliyun.lumina.LuminaFileInput;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -56,6 +58,8 @@ import static org.apache.paimon.utils.Preconditions.checkArgument;
  * vector similarity search.
  */
 public class LuminaVectorGlobalIndexReader implements GlobalIndexReader {
+
+    private static final Logger LOG = LoggerFactory.getLogger(LuminaVectorGlobalIndexReader.class);
 
     /**
      * Sets {@code diskann.search.list_size} when not explicitly configured. The list size is set to
@@ -199,6 +203,7 @@ public class LuminaVectorGlobalIndexReader implements GlobalIndexReader {
 
     private List<Optional<ScoredGlobalIndexResult>> searchBatch(List<VectorSearch> vectorSearches)
             throws IOException {
+        long searchStartTime = System.currentTimeMillis();
         VectorSearch first = vectorSearches.get(0);
         for (VectorSearch vectorSearch : vectorSearches) {
             validateSearchVector(vectorSearch.vector());
@@ -218,6 +223,10 @@ public class LuminaVectorGlobalIndexReader implements GlobalIndexReader {
         long[] scopedIds = null;
         Map<String, String> mergedOptions =
                 mergeOptions(this.options.toLuminaOptions(), indexMeta.options(), first.options());
+        LOG.info(
+                "Batch search with {} queries, includeRowIds is null:{}",
+                vectorSearches.size(),
+                includeRowIds == null);
         if (includeRowIds != null) {
             long cardinality = includeRowIds.getLongCardinality();
             if (cardinality > Integer.MAX_VALUE) {
@@ -274,6 +283,12 @@ public class LuminaVectorGlobalIndexReader implements GlobalIndexReader {
                     indexMetric);
             results.add(Optional.of(toScoredResult(topK)));
         }
+        long cost = (System.currentTimeMillis() - searchStartTime) / 1000;
+        LOG.info(
+                "Finish batch search with {} queries, effectiveK: {}, cost:{}",
+                vectorSearches.size(),
+                effectiveK,
+                cost);
         return results;
     }
 
