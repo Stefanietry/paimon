@@ -25,6 +25,7 @@ import org.apache.paimon.fs.PositionOutputStream;
 import org.apache.paimon.fs.local.LocalFileIO;
 import org.apache.paimon.globalindex.GlobalIndexIOMeta;
 import org.apache.paimon.globalindex.ResultEntry;
+import org.apache.paimon.globalindex.ScoredGlobalIndexResult;
 import org.apache.paimon.globalindex.io.GlobalIndexFileReader;
 import org.apache.paimon.globalindex.io.GlobalIndexFileWriter;
 import org.apache.paimon.options.Options;
@@ -49,6 +50,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
 import java.util.Random;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
@@ -333,6 +335,66 @@ public class LuminaVectorGlobalIndexTest {
             assertThat(result.results().contains(1L)).isTrue();
             assertThat(result.results().contains(4L)).isTrue();
             assertThat(result.results().getLongCardinality()).isEqualTo(2);
+        }
+    }
+
+    @Test
+    public void testBatchSearchMatchesSingleSearch() throws IOException {
+        int dimension = 2;
+        Options options = createDefaultOptions(dimension);
+
+        float[][] vectors =
+                new float[][] {
+                    new float[] {1.0f, 0.0f},
+                    new float[] {0.95f, 0.1f},
+                    new float[] {0.1f, 0.95f},
+                    new float[] {0.98f, 0.05f},
+                    new float[] {0.0f, 1.0f},
+                    new float[] {0.05f, 0.98f}
+                };
+
+        GlobalIndexFileWriter fileWriter = createFileWriter(indexPath);
+        LuminaVectorIndexOptions indexOptions = new LuminaVectorIndexOptions(options);
+        LuminaVectorGlobalIndexWriter writer =
+                new LuminaVectorGlobalIndexWriter(fileWriter, vectorType, indexOptions);
+        Arrays.stream(vectors).forEach(writer::write);
+        List<ResultEntry> results = writer.finish();
+        List<GlobalIndexIOMeta> metas = toIOMetas(results, indexPath);
+
+        GlobalIndexFileReader fileReader = createFileReader(indexPath);
+        try (LuminaVectorGlobalIndexReader reader =
+                new LuminaVectorGlobalIndexReader(
+                        fileReader, metas, vectorType, indexOptions, executor)) {
+            List<VectorSearch> searches =
+                    Arrays.asList(
+                            new VectorSearch(vectors[0], 3, fieldName),
+                            new VectorSearch(vectors[2], 3, fieldName),
+                            new VectorSearch(new float[] {0.85f, 0.15f}, 3, fieldName));
+
+            List<Optional<ScoredGlobalIndexResult>> batchResults =
+                    reader.visitVectorSearchBatch(searches).join();
+            assertThat(batchResults).hasSize(searches.size());
+            for (int i = 0; i < searches.size(); i++) {
+                ScoredGlobalIndexResult single =
+                        reader.visitVectorSearch(searches.get(i)).join().get();
+                assertSameScoredResult(single, batchResults.get(i).get());
+            }
+
+            RoaringNavigableMap64 filter = new RoaringNavigableMap64();
+            filter.add(1L);
+            filter.add(2L);
+            filter.add(3L);
+            List<VectorSearch> filteredSearches =
+                    Arrays.asList(
+                            new VectorSearch(vectors[0], 3, fieldName).withIncludeRowIds(filter),
+                            new VectorSearch(vectors[4], 3, fieldName).withIncludeRowIds(filter));
+            batchResults = reader.visitVectorSearchBatch(filteredSearches).join();
+            assertThat(batchResults).hasSize(filteredSearches.size());
+            for (int i = 0; i < filteredSearches.size(); i++) {
+                ScoredGlobalIndexResult single =
+                        reader.visitVectorSearch(filteredSearches.get(i)).join().get();
+                assertSameScoredResult(single, batchResults.get(i).get());
+            }
         }
     }
 
@@ -748,6 +810,20 @@ public class LuminaVectorGlobalIndexTest {
                 .hasMessageContaining("rowId=1")
                 .hasMessageContaining("index=1")
                 .hasMessageContaining("-Infinity");
+    }
+
+    private void assertSameScoredResult(
+            ScoredGlobalIndexResult expected, ScoredGlobalIndexResult actual) {
+        assertThat(actual.results().getLongCardinality())
+                .isEqualTo(expected.results().getLongCardinality());
+        for (long rowId : expected.results()) {
+            assertThat(actual.results().contains(rowId)).isTrue();
+            assertThat(
+                            Math.abs(
+                                    actual.scoreGetter().score(rowId)
+                                            - expected.scoreGetter().score(rowId)))
+                    .isLessThanOrEqualTo(1.0e-6f);
+        }
     }
 
     private Options createDefaultOptions(int dimension) {

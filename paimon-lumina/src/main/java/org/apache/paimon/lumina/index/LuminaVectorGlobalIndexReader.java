@@ -36,6 +36,7 @@ import org.apache.paimon.utils.RoaringNavigableMap64;
 import org.aliyun.lumina.LuminaFileInput;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -107,6 +108,32 @@ public class LuminaVectorGlobalIndexReader implements GlobalIndexReader {
                 executor);
     }
 
+    @Override
+    public CompletableFuture<List<Optional<ScoredGlobalIndexResult>>> visitVectorSearchBatch(
+            List<VectorSearch> vectorSearches) {
+        if (vectorSearches.isEmpty()) {
+            return CompletableFuture.completedFuture(new ArrayList<>());
+        }
+        if (!canSearchInOneBatch(vectorSearches)) {
+            return GlobalIndexReader.super.visitVectorSearchBatch(vectorSearches);
+        }
+        return CompletableFuture.supplyAsync(
+                () -> {
+                    try {
+                        ensureLoaded();
+                        return searchBatch(vectorSearches);
+                    } catch (IOException e) {
+                        VectorSearch first = vectorSearches.get(0);
+                        throw new RuntimeException(
+                                String.format(
+                                        "Failed to batch search Lumina vector index with fieldName=%s, limit=%d, queries=%d",
+                                        first.fieldName(), first.limit(), vectorSearches.size()),
+                                e);
+                    }
+                },
+                executor);
+    }
+
     private ScoredGlobalIndexResult search(VectorSearch vectorSearch) throws IOException {
         validateSearchVector(vectorSearch.vector());
         float[] queryVector = vectorSearch.vector().clone();
@@ -167,6 +194,133 @@ public class LuminaVectorGlobalIndexReader implements GlobalIndexReader {
                 new PriorityQueue<>(effectiveK + 1, Comparator.comparingDouble(s -> s.score));
         collectResults(distances, labels, effectiveK, effectiveK, topK, indexMetric);
 
+        return toScoredResult(topK);
+    }
+
+    private List<Optional<ScoredGlobalIndexResult>> searchBatch(List<VectorSearch> vectorSearches)
+            throws IOException {
+        VectorSearch first = vectorSearches.get(0);
+        for (VectorSearch vectorSearch : vectorSearches) {
+            validateSearchVector(vectorSearch.vector());
+        }
+
+        int queryCount = vectorSearches.size();
+        int dimension = indexMeta.dim();
+        int limit = first.limit();
+        LuminaVectorMetric indexMetric = indexMeta.metric();
+        int effectiveK = (int) Math.min(limit, index.size());
+        List<Optional<ScoredGlobalIndexResult>> emptyResults = emptyResults(queryCount);
+        if (effectiveK <= 0) {
+            return emptyResults;
+        }
+
+        RoaringNavigableMap64 includeRowIds = first.includeRowIds();
+        long[] scopedIds = null;
+        Map<String, String> mergedOptions =
+                mergeOptions(this.options.toLuminaOptions(), indexMeta.options(), first.options());
+        if (includeRowIds != null) {
+            long cardinality = includeRowIds.getLongCardinality();
+            if (cardinality > Integer.MAX_VALUE) {
+                throw new IllegalArgumentException(
+                        "includeRowIds cardinality ("
+                                + cardinality
+                                + ") exceeds Integer.MAX_VALUE");
+            }
+            scopedIds = new long[(int) cardinality];
+            Iterator<Long> iter = includeRowIds.iterator();
+            for (int i = 0; i < scopedIds.length; i++) {
+                scopedIds[i] = iter.next();
+            }
+            if (scopedIds.length == 0) {
+                return emptyResults;
+            }
+            effectiveK = Math.min(effectiveK, scopedIds.length);
+            mergedOptions.put("search.thread_safe_filter", "true");
+        }
+        ensureSearchListSize(mergedOptions, effectiveK);
+
+        float[] queryVectors = new float[queryCount * dimension];
+        for (int i = 0; i < queryCount; i++) {
+            System.arraycopy(
+                    vectorSearches.get(i).vector(), 0, queryVectors, i * dimension, dimension);
+        }
+        float[] distances = new float[queryCount * effectiveK];
+        long[] labels = new long[queryCount * effectiveK];
+
+        if (scopedIds == null) {
+            index.search(queryVectors, queryCount, effectiveK, distances, labels, mergedOptions);
+        } else {
+            index.searchWithFilter(
+                    queryVectors,
+                    queryCount,
+                    effectiveK,
+                    distances,
+                    labels,
+                    scopedIds,
+                    mergedOptions);
+        }
+
+        List<Optional<ScoredGlobalIndexResult>> results = new ArrayList<>(queryCount);
+        for (int queryIndex = 0; queryIndex < queryCount; queryIndex++) {
+            PriorityQueue<ScoredRow> topK =
+                    new PriorityQueue<>(effectiveK + 1, Comparator.comparingDouble(s -> s.score));
+            collectResults(
+                    distances,
+                    labels,
+                    queryIndex * effectiveK,
+                    effectiveK,
+                    effectiveK,
+                    topK,
+                    indexMetric);
+            results.add(Optional.of(toScoredResult(topK)));
+        }
+        return results;
+    }
+
+    private boolean canSearchInOneBatch(List<VectorSearch> vectorSearches) {
+        VectorSearch first = vectorSearches.get(0);
+        for (int i = 1; i < vectorSearches.size(); i++) {
+            VectorSearch current = vectorSearches.get(i);
+            if (current.limit() != first.limit()
+                    || !current.fieldName().equals(first.fieldName())
+                    || !current.options().equals(first.options())
+                    || !sameIncludeRowIds(current.includeRowIds(), first.includeRowIds())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean sameIncludeRowIds(
+            RoaringNavigableMap64 left, RoaringNavigableMap64 right) {
+        if (left == right) {
+            return true;
+        }
+        if (left == null || right == null) {
+            return false;
+        }
+        if (left.getLongCardinality() != right.getLongCardinality()) {
+            return false;
+        }
+        Iterator<Long> leftIterator = left.iterator();
+        Iterator<Long> rightIterator = right.iterator();
+        while (leftIterator.hasNext() && rightIterator.hasNext()) {
+            if (!leftIterator.next().equals(rightIterator.next())) {
+                return false;
+            }
+        }
+        return !leftIterator.hasNext() && !rightIterator.hasNext();
+    }
+
+    private static List<Optional<ScoredGlobalIndexResult>> emptyResults(int size) {
+        List<Optional<ScoredGlobalIndexResult>> results = new ArrayList<>(size);
+        for (int i = 0; i < size; i++) {
+            results.add(Optional.empty());
+        }
+        return results;
+    }
+
+    private static LuminaScoredGlobalIndexResult toScoredResult(PriorityQueue<ScoredRow> topK) {
         RoaringNavigableMap64 roaringBitmap64 = new RoaringNavigableMap64();
         HashMap<Long, Float> id2scores = new HashMap<>(topK.size());
         for (ScoredRow row : topK) {
@@ -200,7 +354,18 @@ public class LuminaVectorGlobalIndexReader implements GlobalIndexReader {
             int limit,
             PriorityQueue<ScoredRow> topK,
             LuminaVectorMetric metric) {
-        for (int i = 0; i < count; i++) {
+        collectResults(distances, labels, 0, count, limit, topK, metric);
+    }
+
+    private static void collectResults(
+            float[] distances,
+            long[] labels,
+            int offset,
+            int count,
+            int limit,
+            PriorityQueue<ScoredRow> topK,
+            LuminaVectorMetric metric) {
+        for (int i = offset; i < offset + count; i++) {
             long rowId = labels[i];
             if (rowId < 0) {
                 continue;
