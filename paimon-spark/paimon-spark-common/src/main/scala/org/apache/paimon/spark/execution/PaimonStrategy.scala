@@ -19,18 +19,23 @@
 package org.apache.paimon.spark.execution
 
 import org.apache.paimon.CoreOptions
-import org.apache.paimon.globalindex.{GlobalIndexResult, ScoredGlobalIndexResult}
+import org.apache.paimon.fs.FileIO
+import org.apache.paimon.globalindex.{GlobalIndexer, GlobalIndexerFactoryUtils, GlobalIndexIOMeta, GlobalIndexReader, GlobalIndexReadThreadPool, GlobalIndexResult, OffsetGlobalIndexReader, ScoredGlobalIndexResult}
+import org.apache.paimon.globalindex.io.GlobalIndexFileReader
+import org.apache.paimon.index.IndexPathFactory
 import org.apache.paimon.partition.PartitionPredicate
+import org.apache.paimon.predicate.VectorSearch
 import org.apache.paimon.spark.{PaimonRecordReaderIterator, SparkCatalog, SparkGenericCatalog, SparkTable, SparkUtils}
 import org.apache.paimon.spark.catalog.{SparkBaseCatalog, SupportView}
 import org.apache.paimon.spark.catalyst.analysis.ResolvedPaimonView
 import org.apache.paimon.spark.catalyst.plans.logical.{CopyIntoLocationCommand, CopyIntoLocationSource, CopyIntoTableCommand, CreateOrReplaceTagCommand, CreatePaimonView, DeleteTagCommand, DropPaimonView, LateralVectorSearch, PaimonCallCommand, PaimonDropPartitions, RenameTagCommand, ResolvedIdentifier, ShowPaimonViews, ShowTagsCommand, TruncatePaimonTableWithFilter}
 import org.apache.paimon.spark.data.SparkInternalRow
 import org.apache.paimon.spark.schema.PaimonMetadataColumn
-import org.apache.paimon.table.{InnerTable, SpecialFields, Table}
-import org.apache.paimon.table.source.{InnerTableScan, ReadBuilder, VectorScan, VectorSearchBuilder}
+import org.apache.paimon.table.{FileStoreTable, InnerTable, SpecialFields, Table}
+import org.apache.paimon.table.source.{InnerTableScan, ReadBuilder, VectorScan, VectorSearchSplit}
+import org.apache.paimon.types.DataField
 import org.apache.paimon.types.RowType
-import org.apache.paimon.utils.RoaringNavigableMap64
+import org.apache.paimon.utils.{IOUtils, RoaringNavigableMap64}
 
 import org.apache.spark.TaskContext
 import org.apache.spark.internal.Logging
@@ -47,7 +52,14 @@ import org.apache.spark.sql.execution.datasources.v2.{DataSourceV2Implicits, Dat
 import org.apache.spark.sql.execution.shim.{PaimonCreateTableAsSelectStrategy, PaimonReplaceTableAsSelectStrategy, PaimonReplaceTableStrategy}
 import org.apache.spark.sql.paimon.shims.SparkShimLoader
 
+import java.util.Arrays
+import java.util.Collections
+import java.util.Optional
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.ExecutorService
+
 import scala.collection.JavaConverters._
+import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 
 case class PaimonStrategy(spark: SparkSession)
@@ -276,6 +288,7 @@ case class LateralVectorSearchExec(
         val rightProjection = UnsafeProjection.create(projectList, vectorSearchOutput)
         val joinedRow = new JoinedRow
         lazy val searchContext = createSearchContext(rightProjection)
+        var searchRuntime: LateralVectorSearchRuntime = null
         val batchSize = searchContext.batchSize
         var batchNumber = 0L
         var totalOuterRowCount = 0L
@@ -283,6 +296,9 @@ case class LateralVectorSearchExec(
         val totalStartMillis = System.currentTimeMillis()
         Option(TaskContext.get()).foreach(_.addTaskCompletionListener[Unit] {
           _ =>
+            if (searchRuntime != null) {
+              searchRuntime.close()
+            }
             val totalElapsedSeconds = (System.currentTimeMillis() - totalStartMillis) / 1000.0
             logInfo(
               s"Finished lateral vector search, " +
@@ -312,7 +328,10 @@ case class LateralVectorSearchExec(
             val resultIterator = if (searchBatch.isEmpty) {
               Iterator.empty
             } else {
-              search(searchBatch, searchContext).map {
+              if (searchRuntime == null) {
+                searchRuntime = new LateralVectorSearchRuntime(searchContext)
+              }
+              search(searchBatch, searchContext, searchRuntime).map {
                 case (outerRow, rightRow) =>
                   joinedRow(outerRow, rightRow)
                   joinedRow.copy()
@@ -372,7 +391,6 @@ case class LateralVectorSearchExec(
 
     LateralVectorSearchContext(
       readBuilder,
-      vectorSearchBuilder,
       vectorPlan,
       scoreMetadataColumns,
       sparkRow,
@@ -393,13 +411,11 @@ case class LateralVectorSearchExec(
 
   private def search(
       queries: Seq[LateralVectorSearchQuery],
-      context: LateralVectorSearchContext): Iterator[(InternalRow, InternalRow)] = {
+      context: LateralVectorSearchContext,
+      runtime: LateralVectorSearchRuntime): Iterator[(InternalRow, InternalRow)] = {
     val vectors = queries.map(_.queryVector).asJava
     val vectorSearchStartMillis = System.currentTimeMillis()
-    val globalIndexResults = context.vectorSearchBuilder
-      .newVectorRead()
-      .readBatch(vectors, context.vectorPlan.splits())
-      .asScala
+    val globalIndexResults = runtime.readBatch(vectors).asScala
     val vectorSearchElapsedSeconds = (System.currentTimeMillis() - vectorSearchStartMillis) / 1000.0
     logInfo(
       s"Finished lateral vector search read batch, " +
@@ -539,9 +555,153 @@ case class LateralVectorSearchExec(
     name == PaimonMetadataColumn.VECTOR_SEARCH_SCORE_COLUMN
   }
 
+  private class LateralVectorSearchRuntime(context: LateralVectorSearchContext)
+    extends AutoCloseable {
+
+    private val table = innerTable.asInstanceOf[FileStoreTable]
+    private lazy val vectorColumn: DataField = table.rowType().getField(columnName)
+    private val splits = context.vectorPlan.splits()
+    private lazy val indexType = splits.get(0).vectorIndexFiles().get(0).indexType()
+    private lazy val globalIndexer: GlobalIndexer = GlobalIndexerFactoryUtils
+      .load(indexType)
+      .create(vectorColumn, table.coreOptions().toConfiguration())
+    private val indexPathFactory: IndexPathFactory =
+      table.store().pathFactory().globalIndexFileFactory()
+    private val fileIO: FileIO = table.fileIO()
+    private val parallelism =
+      table.coreOptions().toConfiguration().get(CoreOptions.GLOBAL_INDEX_THREAD_NUM)
+    private val executor: ExecutorService =
+      GlobalIndexReadThreadPool.getExecutorService(parallelism)
+    private val maxInFlight = Math.max(1, parallelism)
+    private val localReaders =
+      mutable.HashMap[LateralVectorSearchReaderCacheKey, BorrowedLateralVectorSearchReader]()
+
+    private var closed = false
+
+    def readBatch(vectors: java.util.List[Array[Float]]): java.util.List[GlobalIndexResult] = {
+      val emptyResults = new java.util.ArrayList[GlobalIndexResult](vectors.size())
+      for (_ <- 0 until vectors.size()) {
+        emptyResults.add(GlobalIndexResult.createEmpty())
+      }
+      if (vectors.isEmpty || splits.isEmpty) {
+        return emptyResults
+      }
+
+      val scoredResults = new java.util.ArrayList[ScoredGlobalIndexResult](vectors.size())
+      for (_ <- 0 until vectors.size()) {
+        scoredResults.add(ScoredGlobalIndexResult.createEmpty())
+      }
+
+      val futures = new java.util.ArrayList[CompletableFuture[
+        java.util.List[Optional[ScoredGlobalIndexResult]]]](maxInFlight)
+      splits.asScala.foreach {
+        split =>
+          futures.add(evalBatch(split, vectors))
+          if (futures.size() >= maxInFlight) {
+            mergeBatchResults(scoredResults, futures)
+            futures.clear()
+          }
+      }
+      mergeBatchResults(scoredResults, futures)
+
+      val results = new java.util.ArrayList[GlobalIndexResult](vectors.size())
+      for (i <- 0 until scoredResults.size()) {
+        results.add(scoredResults.get(i).topK(limit))
+      }
+      results
+    }
+
+    private def evalBatch(split: VectorSearchSplit, vectors: java.util.List[Array[Float]])
+        : CompletableFuture[java.util.List[Optional[ScoredGlobalIndexResult]]] = {
+      val borrowedReader = readerForSplit(split)
+      val vectorSearches = new java.util.ArrayList[VectorSearch](vectors.size())
+      for (i <- 0 until vectors.size()) {
+        vectorSearches.add(
+          new VectorSearch(
+            vectors.get(i),
+            limit,
+            columnName,
+            Collections.emptyMap[String, String]()))
+      }
+
+      new OffsetGlobalIndexReader(borrowedReader.reader, split.rowRangeStart(), split.rowRangeEnd())
+        .visitVectorSearchBatch(vectorSearches)
+    }
+
+    private def mergeBatchResults(
+        scoredResults: java.util.List[ScoredGlobalIndexResult],
+        futures: java.util.List[CompletableFuture[
+          java.util.List[Optional[ScoredGlobalIndexResult]]]]): Unit = {
+      if (futures.isEmpty) {
+        return
+      }
+
+      CompletableFuture.allOf(futures.asScala.toArray: _*).join()
+      futures.asScala.foreach {
+        future =>
+          val next = future.join()
+          for (i <- 0 until next.size()) {
+            if (next.get(i).isPresent) {
+              scoredResults.set(i, scoredResults.get(i).or(next.get(i).get()).topK(limit))
+            }
+          }
+      }
+    }
+
+    private def readerForSplit(split: VectorSearchSplit): BorrowedLateralVectorSearchReader = {
+      val key = readerCacheKey(split)
+      localReaders.getOrElseUpdate(
+        key,
+        LateralVectorSearchExecutorReaderCache
+          .borrow(key)
+          .getOrElse(BorrowedLateralVectorSearchReader(key, createReader(split))))
+    }
+
+    private def createReader(split: VectorSearchSplit): GlobalIndexReader = {
+      val indexIOMetas = new java.util.ArrayList[GlobalIndexIOMeta](split.vectorIndexFiles().size())
+      split.vectorIndexFiles().asScala.foreach {
+        indexFile =>
+          val meta = indexFile.globalIndexMeta()
+          indexIOMetas.add(
+            new GlobalIndexIOMeta(
+              indexPathFactory.toPath(indexFile),
+              indexFile.fileSize(),
+              meta.indexMeta()))
+      }
+      val indexFileReader: GlobalIndexFileReader =
+        (meta: GlobalIndexIOMeta) => fileIO.newInputStream(meta.filePath())
+      globalIndexer.createReader(indexFileReader, indexIOMetas, executor)
+    }
+
+    private def readerCacheKey(split: VectorSearchSplit): LateralVectorSearchReaderCacheKey = {
+      val paths = ArrayBuffer[String]()
+      val fileSizes = ArrayBuffer[Long]()
+      val metadataHashes = ArrayBuffer[Int]()
+      split.vectorIndexFiles().asScala.foreach {
+        indexFile =>
+          val meta = indexFile.globalIndexMeta()
+          paths += indexPathFactory.toPath(indexFile).toString
+          fileSizes += indexFile.fileSize()
+          metadataHashes += Arrays.hashCode(meta.indexMeta())
+      }
+      LateralVectorSearchReaderCacheKey(
+        indexType,
+        paths.toSeq,
+        fileSizes.toSeq,
+        metadataHashes.toSeq)
+    }
+
+    override def close(): Unit = {
+      if (!closed) {
+        closed = true
+        localReaders.values.foreach(LateralVectorSearchExecutorReaderCache.release)
+        localReaders.clear()
+      }
+    }
+  }
+
   private case class LateralVectorSearchContext(
       readBuilder: ReadBuilder,
-      vectorSearchBuilder: VectorSearchBuilder,
       vectorPlan: VectorScan.Plan,
       scoreMetadataColumns: Seq[PaimonMetadataColumn],
       sparkRow: SparkInternalRow,
@@ -554,4 +714,39 @@ case class LateralVectorSearchExec(
   private case class LateralVectorSearchQuery(outerRow: InternalRow, queryVector: Array[Float])
 
   private case class LateralVectorSearchMatch(rowId: Long, outerRow: InternalRow, score: Float)
+}
+
+private case class LateralVectorSearchReaderCacheKey(
+    indexType: String,
+    paths: Seq[String],
+    fileSizes: Seq[Long],
+    metadataHashes: Seq[Int])
+
+private case class BorrowedLateralVectorSearchReader(
+    key: LateralVectorSearchReaderCacheKey,
+    reader: GlobalIndexReader)
+
+private object LateralVectorSearchExecutorReaderCache {
+
+  private val MaxCachedReaders = 64
+  private val cachedReaders =
+    mutable.LinkedHashMap[LateralVectorSearchReaderCacheKey, GlobalIndexReader]()
+
+  def borrow(key: LateralVectorSearchReaderCacheKey): Option[BorrowedLateralVectorSearchReader] =
+    synchronized {
+      cachedReaders.remove(key).map(BorrowedLateralVectorSearchReader(key, _))
+    }
+
+  def release(borrowedReader: BorrowedLateralVectorSearchReader): Unit = synchronized {
+    if (cachedReaders.contains(borrowedReader.key)) {
+      IOUtils.closeQuietly(borrowedReader.reader)
+      return
+    }
+    if (cachedReaders.size >= MaxCachedReaders) {
+      val oldestKey = cachedReaders.head._1
+      val oldestReader = cachedReaders.remove(oldestKey).get
+      IOUtils.closeQuietly(oldestReader)
+    }
+    cachedReaders.put(borrowedReader.key, borrowedReader.reader)
+  }
 }
