@@ -28,6 +28,7 @@ import org.apache.paimon.spark.catalog.{SparkBaseCatalog, SupportView}
 import org.apache.paimon.spark.catalyst.analysis.ResolvedPaimonView
 import org.apache.paimon.spark.catalyst.plans.logical.{CopyIntoLocationCommand, CopyIntoLocationSource, CopyIntoTableCommand, CreateOrReplaceTagCommand, CreatePaimonView, DeleteTagCommand, DropPaimonView, LateralVectorSearch, PaimonCallCommand, PaimonDropPartitions, PaimonTableValuedFunctions, RenameTagCommand, ResolvedIdentifier, ShowPaimonViews, ShowTagsCommand, TruncatePaimonTableWithFilter}
 import org.apache.paimon.spark.data.SparkInternalRow
+import org.apache.paimon.spark.read.VectorSearchResultUtils
 import org.apache.paimon.spark.schema.PaimonMetadataColumn
 import org.apache.paimon.table.{InnerTable, SpecialFields, Table}
 import org.apache.paimon.table.source.{BatchVectorSearchBuilder, InnerTableScan, ReadBuilder, VectorScan}
@@ -371,6 +372,7 @@ case class LateralVectorSearchExec(
       scoreMetadataColumns,
       sparkRow,
       rowIdOrdinal = resultRowType.getFieldIndex(SpecialFields.ROW_ID.name()),
+      rowIdScoreOnly = VectorSearchResultUtils.isRowIdScoreOnly(vectorSearchOutput.map(_.name)),
       projectionInputOrdinals = vectorSearchOutput.map {
         attr =>
           if (attr.name == PaimonMetadataColumn.SEARCH_SCORE_COLUMN) {
@@ -442,6 +444,9 @@ case class LateralVectorSearchExec(
       s"Batch vector search returned ${globalIndexResults.size} results for ${queries.size} " +
         "query vectors. The result count must match the query count."
     )
+    if (context.rowIdScoreOnly) {
+      return searchRowIdScoreOnly(queries, globalIndexResults, context)
+    }
     val rowIdToMatches = createRowIdToMatches(queries, globalIndexResults)
     val batchGlobalIndexResult = createBatchGlobalIndexResult(globalIndexResults)
     val scan = context.readBuilder
@@ -474,6 +479,28 @@ case class LateralVectorSearchExec(
             }
           }
         }.flatMap(identity)
+    }
+  }
+
+  private def searchRowIdScoreOnly(
+      queries: Seq[LateralVectorSearchQuery],
+      globalIndexResults: Seq[GlobalIndexResult],
+      context: LateralVectorSearchContext): Iterator[(InternalRow, InternalRow)] = {
+    queries.zip(globalIndexResults).iterator.flatMap {
+      case (query, result) =>
+        val scoreGetter = result match {
+          case scored: ScoredGlobalIndexResult => Some(scored.scoreGetter())
+          case _ => None
+        }
+        result.results().iterator().asScala.map {
+          rowId =>
+            val values = vectorSearchOutput
+              .map(attr => VectorSearchResultUtils.valueOf(attr.name, rowId, scoreGetter))
+              .toArray
+            val projectedRow = context.rightProjection(
+              new JoinedRow(query.outerRow, new GenericInternalRow(values.asInstanceOf[Array[Any]])))
+            (query.outerRow, projectedRow)
+        }
     }
   }
 
@@ -585,6 +612,7 @@ case class LateralVectorSearchExec(
       scoreMetadataColumns: Seq[PaimonMetadataColumn],
       sparkRow: SparkInternalRow,
       rowIdOrdinal: Int,
+      rowIdScoreOnly: Boolean,
       projectionInputOrdinals: Seq[Int],
       rightProjection: UnsafeProjection,
       batchSize: Int,
