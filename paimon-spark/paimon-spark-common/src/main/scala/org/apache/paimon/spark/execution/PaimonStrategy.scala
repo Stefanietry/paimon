@@ -296,9 +296,9 @@ case class LateralVectorSearchExec(
           .foreach(_.addTaskCompletionListener[Unit](_ => readerTracker.closeCurrent()))
         val searchContext = createSearchContext(rightProjection, readerTracker)
         val batchSize = searchContext.batchSize
-
         outerRows.map(_.copy()).grouped(batchSize).flatMap {
           outerRowBatch =>
+            val searchStartTime = System.currentTimeMillis()
             val searchBatch = ArrayBuffer[LateralVectorSearchQuery]()
             outerRowBatch.foreach {
               outerRow =>
@@ -307,6 +307,8 @@ case class LateralVectorSearchExec(
                     queryVector => searchBatch += LateralVectorSearchQuery(outerRow, queryVector))
             }
 
+            log.info(
+              s"Search time: ${System.currentTimeMillis() - searchStartTime} ms, batchSize: $batchSize")
             if (searchBatch.isEmpty) {
               Iterator.empty
             } else {
