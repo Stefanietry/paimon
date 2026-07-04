@@ -120,7 +120,7 @@ public class IndexedSplitRecordReader implements RecordReader<InternalRow> {
         RowType actualReadType = readRowType;
         ProjectedRow projectedRow = null;
 
-        if (rowIdToScore != null && rowIdIndex == -1) {
+        if (rowIdIndex == -1) {
             actualReadType = SpecialFields.rowTypeWithRowId(readRowType);
             rowIdIndex = actualReadType.getFieldCount() - 1;
             int[] mappings = new int[readRowType.getFieldCount()];

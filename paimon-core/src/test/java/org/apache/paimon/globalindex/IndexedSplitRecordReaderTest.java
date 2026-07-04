@@ -139,12 +139,14 @@ public class IndexedSplitRecordReaderTest {
         InternalRow row0 = iterator.next();
         assertThat(row0).isNotNull();
         assertThat(row0.getInt(0)).isEqualTo(1);
+        assertThat(iterator.returnedRowId()).isEqualTo(0L);
         // Score should be NaN when no scores provided
         assertThat(Float.isNaN(iterator.returnedScore())).isTrue();
 
         InternalRow row1 = iterator.next();
         assertThat(row1).isNotNull();
         assertThat(row1.getInt(0)).isEqualTo(2);
+        assertThat(iterator.returnedRowId()).isEqualTo(1L);
 
         assertThat(iterator.next()).isNull();
 
@@ -233,10 +235,56 @@ public class IndexedSplitRecordReaderTest {
 
         // rowIdToScore should be null
         assertThat(info.rowIdToScore).isNull();
-        // actualReadType should be the same as input (no need to add _ROW_ID)
-        assertThat(info.actualReadType).isEqualTo(readRowType);
-        // projectedRow should be null
-        assertThat(info.projectedRow).isNull();
+        // actualReadType should have _ROW_ID appended so callers can retrieve returnedRowId.
+        assertThat(info.actualReadType.getFieldCount()).isEqualTo(3);
+        assertThat(info.actualReadType.getFieldNames()).contains("_ROW_ID");
+        assertThat(info.rowIdIndex).isEqualTo(2);
+        // projectedRow should be set to project out _ROW_ID.
+        assertThat(info.projectedRow).isNotNull();
+    }
+
+    @Test
+    public void testReadReturnedRowIdWithoutScoresAndProjection() throws IOException {
+        List<InternalRow> rows =
+                Arrays.asList(
+                        GenericRow.of(1, BinaryString.fromString("Alice"), 10L),
+                        GenericRow.of(2, BinaryString.fromString("Bob"), 11L));
+
+        MockRecordReader mockReader = new MockRecordReader(rows);
+        RowType readRowType =
+                RowType.of(
+                        new org.apache.paimon.types.DataType[] {
+                            DataTypes.INT(), DataTypes.STRING()
+                        },
+                        new String[] {"id", "name"});
+        IndexedSplit indexedSplit =
+                createIndexedSplit(Collections.singletonList(new Range(10, 11)), null);
+
+        IndexedSplitRecordReader.Info info =
+                IndexedSplitRecordReader.readInfo(readRowType, indexedSplit);
+        IndexedSplitRecordReader reader = new IndexedSplitRecordReader(mockReader, info);
+
+        ScoreRecordIterator<InternalRow> iterator = reader.readBatch();
+        assertThat(iterator).isNotNull();
+
+        InternalRow row0 = iterator.next();
+        assertThat(row0).isNotNull();
+        assertThat(row0.getFieldCount()).isEqualTo(2);
+        assertThat(row0.getInt(0)).isEqualTo(1);
+        assertThat(row0.getString(1).toString()).isEqualTo("Alice");
+        assertThat(iterator.returnedRowId()).isEqualTo(10L);
+        assertThat(Float.isNaN(iterator.returnedScore())).isTrue();
+
+        InternalRow row1 = iterator.next();
+        assertThat(row1).isNotNull();
+        assertThat(row1.getFieldCount()).isEqualTo(2);
+        assertThat(row1.getInt(0)).isEqualTo(2);
+        assertThat(row1.getString(1).toString()).isEqualTo("Bob");
+        assertThat(iterator.returnedRowId()).isEqualTo(11L);
+        assertThat(Float.isNaN(iterator.returnedScore())).isTrue();
+
+        assertThat(iterator.next()).isNull();
+        reader.close();
     }
 
     @Test

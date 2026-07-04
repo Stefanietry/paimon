@@ -49,7 +49,7 @@ case class PaimonRecordReaderIterator(
   private val needPathAndIndexMetadata =
     metadataColumns.exists(c => PATH_AND_INDEX_META_COLUMNS.contains(c.name))
   private val needScoreMetadata = {
-    metadataColumns.exists(_.name == SEARCH_SCORE_COLUMN)
+    metadataColumns.exists(c => c.name == ROW_ID_COLUMN || c.name == SEARCH_SCORE_COLUMN)
   }
   Preconditions.checkArgument(
     !needScoreMetadata ||
