@@ -88,7 +88,7 @@ public class IndexManifestFileHandler {
         Map<String, List<IndexManifestEntry>> result = new HashMap<>();
 
         for (IndexManifestEntry entry : indexFiles) {
-            String indexType = entry.indexFile().indexType();
+            String indexType = entry.indexType();
             result.computeIfAbsent(indexType, k -> new ArrayList<>()).add(entry);
         }
         return result;
@@ -207,7 +207,7 @@ public class IndexManifestFileHandler {
                 List<IndexManifestEntry> prevIndexFiles, List<IndexManifestEntry> newIndexFiles) {
             Map<String, IndexManifestEntry> indexEntries = new HashMap<>();
             for (IndexManifestEntry entry : prevIndexFiles) {
-                indexEntries.put(entry.indexFile().fileName(), entry);
+                indexEntries.put(entryKey(entry), entry);
             }
 
             // The deleted entry is processed first to avoid overwriting a new entry.
@@ -220,13 +220,24 @@ public class IndexManifestFileHandler {
                             .filter(f -> f.kind() == FileKind.ADD)
                             .collect(Collectors.toList());
             for (IndexManifestEntry entry : removed) {
-                indexEntries.remove(entry.indexFile().fileName());
+                indexEntries.remove(entryKey(entry));
             }
             validateRetainedIndexFiles(indexEntries.values(), added);
             for (IndexManifestEntry entry : added) {
-                indexEntries.put(entry.indexFile().fileName(), entry);
+                indexEntries.put(entryKey(entry), entry);
             }
             return new ArrayList<>(indexEntries.values());
+        }
+
+        private static String entryKey(IndexManifestEntry entry) {
+            return ""
+                    + entry.partition()
+                    + ':'
+                    + entry.bucket()
+                    + ':'
+                    + entry.indexType()
+                    + ':'
+                    + entry.indexFile().fileName();
         }
 
         private void validateRetainedIndexFiles(
@@ -275,7 +286,7 @@ public class IndexManifestFileHandler {
         return new BucketIdentifier(
                 indexManifestEntry.partition(),
                 indexManifestEntry.bucket(),
-                indexManifestEntry.indexFile().indexType());
+                indexManifestEntry.indexType());
     }
 
     /** The {@link BucketIdentifier} of a {@link IndexFileMeta}. */

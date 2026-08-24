@@ -22,10 +22,12 @@ import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.data.GenericArray;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.globalindex.IndexFileKind;
 import org.apache.paimon.index.GlobalIndexMeta;
 import org.apache.paimon.index.IndexFileMeta;
 import org.apache.paimon.utils.VersionedObjectSerializer;
 
+import java.nio.charset.StandardCharsets;
 import java.util.function.Function;
 
 import static org.apache.paimon.data.BinaryString.fromString;
@@ -43,7 +45,7 @@ public class IndexManifestEntrySerializer extends VersionedObjectSerializer<Inde
 
     @Override
     public int getVersion() {
-        return 2;
+        return 6;
     }
 
     @Override
@@ -66,24 +68,28 @@ public class IndexManifestEntrySerializer extends VersionedObjectSerializer<Inde
                 record.kind().toByteValue(),
                 serializeBinaryRow(record.partition()),
                 record.bucket(),
-                fromString(indexFile.indexType()),
+                fromString(record.indexType()),
                 fromString(indexFile.fileName()),
                 indexFile.fileSize(),
                 indexFile.rowCount(),
                 dvMetasToRowArrayData(indexFile.dvRanges()),
                 fromString(indexFile.externalPath()),
-                globalIndexRow);
+                globalIndexRow,
+                indexFile.fileKind() == IndexFileKind.DATA
+                        ? null
+                        : fromString(indexFile.fileKind().name()));
     }
 
     @Override
     public IndexManifestEntry convertFrom(int version, InternalRow row) {
-        if (version < 1 || version > 2) {
+        if (version < 1 || version > 6) {
             throw new UnsupportedOperationException("Unsupported version: " + version);
         }
 
         GlobalIndexMeta globalIndexMeta = null;
+        IndexFileKind indexFileKind = IndexFileKind.DATA;
         if (!row.isNullAt(9)) {
-            InternalRow globalIndexRow = row.getRow(9, version == 1 ? 5 : 6);
+            InternalRow globalIndexRow = row.getRow(9, globalIndexFieldCount(version));
             long rowRangeStart = globalIndexRow.getLong(0);
             long rowRangeEnd = globalIndexRow.getLong(1);
             int indexFieldId = globalIndexRow.getInt(2);
@@ -92,6 +98,23 @@ public class IndexManifestEntrySerializer extends VersionedObjectSerializer<Inde
             byte[] indexMeta = globalIndexRow.isNullAt(4) ? null : globalIndexRow.getBinary(4);
             byte[] sourceMeta =
                     version == 1 || globalIndexRow.isNullAt(5) ? null : globalIndexRow.getBinary(5);
+            if (version == 3 || version == 4) {
+                String globalIndexFileKind =
+                        globalIndexRow.isNullAt(6) ? null : globalIndexRow.getString(6).toString();
+                String shardMode =
+                        globalIndexRow.isNullAt(7) ? null : globalIndexRow.getString(7).toString();
+                if ("IVF_PQ_CENTROID_ID".equals(globalIndexFileKind)) {
+                    globalIndexFileKind = "ROUTING_MODEL";
+                    shardMode = "centroid-based";
+                }
+                if ("ROUTING_MODEL".equals(globalIndexFileKind)) {
+                    indexFileKind = IndexFileKind.ROUTING_MODEL;
+                    indexMeta = routingModelIndexMeta(shardMode);
+                }
+            } else if (version == 5 && isLegacyRoutingModelIndexMeta(indexMeta)) {
+                indexFileKind = IndexFileKind.ROUTING_MODEL;
+                indexMeta = stripLegacyFileKind(indexMeta);
+            }
             globalIndexMeta =
                     new GlobalIndexMeta(
                             rowRangeStart,
@@ -100,6 +123,9 @@ public class IndexManifestEntrySerializer extends VersionedObjectSerializer<Inde
                             extralFields,
                             indexMeta,
                             sourceMeta);
+        }
+        if (version >= 6 && !row.isNullAt(10)) {
+            indexFileKind = IndexFileKind.valueOf(row.getString(10).toString());
         }
 
         return new IndexManifestEntry(
@@ -113,7 +139,52 @@ public class IndexManifestEntrySerializer extends VersionedObjectSerializer<Inde
                         row.getLong(6),
                         row.isNullAt(7) ? null : rowArrayDataToDvMetas(row.getArray(7)),
                         row.isNullAt(8) ? null : row.getString(8).toString(),
-                        globalIndexMeta));
+                        globalIndexMeta,
+                        indexFileKind));
+    }
+
+    private static int globalIndexFieldCount(int version) {
+        if (version == 1) {
+            return 5;
+        }
+        if (version == 2) {
+            return 6;
+        }
+        if (version == 3 || version == 4) {
+            return 8;
+        }
+        return 6;
+    }
+
+    private static byte[] routingModelIndexMeta(String shardMode) {
+        String effectiveShardMode =
+                shardMode == null || shardMode.isEmpty() ? "centroid-based" : shardMode;
+        return ("{\"shardMode\":\"" + effectiveShardMode + "\"}").getBytes(StandardCharsets.UTF_8);
+    }
+
+    private static boolean isLegacyRoutingModelIndexMeta(byte[] indexMeta) {
+        if (indexMeta == null) {
+            return false;
+        }
+        String meta = new String(indexMeta, StandardCharsets.UTF_8);
+        return meta.contains("\"fileKind\":\"ROUTING_MODEL\"")
+                || meta.contains("\"fileKind\" : \"ROUTING_MODEL\"");
+    }
+
+    private static byte[] stripLegacyFileKind(byte[] indexMeta) {
+        String meta = new String(indexMeta, StandardCharsets.UTF_8);
+        String shardMode = null;
+        String key = "\"shardMode\"";
+        int keyPos = meta.indexOf(key);
+        if (keyPos >= 0) {
+            int colon = meta.indexOf(':', keyPos + key.length());
+            int firstQuote = colon < 0 ? -1 : meta.indexOf('"', colon + 1);
+            int secondQuote = firstQuote < 0 ? -1 : meta.indexOf('"', firstQuote + 1);
+            if (secondQuote > firstQuote) {
+                shardMode = meta.substring(firstQuote + 1, secondQuote);
+            }
+        }
+        return routingModelIndexMeta(shardMode);
     }
 
     public static Function<InternalRow, BinaryRow> partitionGetter() {

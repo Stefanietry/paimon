@@ -355,9 +355,15 @@ public class GlobalIndexBuilderUtils {
         for (ResultEntry entry : entries) {
             String fileName = entry.fileName();
             long fileSize = fileIO.getFileSize(indexPathFactory.toPath(fileName));
+            Range entryRange = entry.rowRange() == null ? range : entry.rowRange();
             GlobalIndexMeta globalIndexMeta =
                     new GlobalIndexMeta(
-                            range.from, range.to, indexFieldId, extraFieldIds, entry.meta());
+                            entryRange.from,
+                            entryRange.to,
+                            indexFieldId,
+                            extraFieldIds,
+                            entry.meta(),
+                            null);
 
             Path externalPathDir = options.globalIndexExternalPath();
             String externalPathString = null;
@@ -371,8 +377,10 @@ public class GlobalIndexBuilderUtils {
                             fileName,
                             fileSize,
                             entry.rowCount(),
+                            null,
+                            externalPathString,
                             globalIndexMeta,
-                            externalPathString);
+                            entry.fileKind());
             results.add(indexFileMeta);
         }
         return results;

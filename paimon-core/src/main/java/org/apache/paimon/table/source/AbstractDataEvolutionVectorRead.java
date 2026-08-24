@@ -349,7 +349,8 @@ public abstract class AbstractDataEvolutionVectorRead implements Serializable {
                     new GlobalIndexIOMeta(
                             indexPathFactory.toPath(indexFile),
                             indexFile.fileSize(),
-                            meta.indexMeta()));
+                            meta.indexMeta(),
+                            indexFile.fileKind()));
         }
         return indexIOMetaList;
     }

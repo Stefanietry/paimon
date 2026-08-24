@@ -61,11 +61,13 @@ public class IndexManifestEntry {
                                     "_DELETIONS_VECTORS_RANGES",
                                     new ArrayType(true, DeletionVectorMeta.SCHEMA)),
                             new DataField(8, "_EXTERNAL_PATH", newStringType(true)),
-                            new DataField(9, "_GLOBAL_INDEX", GlobalIndexMeta.SCHEMA)));
+                            new DataField(9, "_GLOBAL_INDEX", GlobalIndexMeta.SCHEMA),
+                            new DataField(10, "_INDEX_FILE_KIND", newStringType(true))));
 
     private final FileKind kind;
     private final BinaryRow partition;
     private final int bucket;
+    private final String indexType;
     private final IndexFileMeta indexFile;
 
     public IndexManifestEntry(
@@ -73,12 +75,13 @@ public class IndexManifestEntry {
         this.kind = kind;
         this.partition = partition;
         this.bucket = bucket;
+        this.indexType = indexFile.indexType();
         this.indexFile = indexFile;
     }
 
     public IndexManifestEntry toDeleteEntry() {
         checkArgument(kind == FileKind.ADD);
-        return new IndexManifestEntry(FileKind.DELETE, partition, bucket, indexFile);
+        return new IndexManifestEntry(FileKind.DELETE, partition, bucket, indexFile());
     }
 
     public FileKind kind() {
@@ -91,6 +94,10 @@ public class IndexManifestEntry {
 
     public int bucket() {
         return bucket;
+    }
+
+    public String indexType() {
+        return indexType;
     }
 
     public IndexFileMeta indexFile() {
@@ -109,12 +116,13 @@ public class IndexManifestEntry {
         return bucket == entry.bucket
                 && kind == entry.kind
                 && Objects.equals(partition, entry.partition)
+                && Objects.equals(indexType, entry.indexType)
                 && Objects.equals(indexFile, entry.indexFile);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(kind, partition, bucket, indexFile);
+        return Objects.hash(kind, partition, bucket, indexType, indexFile);
     }
 
     @Override
@@ -126,6 +134,8 @@ public class IndexManifestEntry {
                 + partition
                 + ", bucket="
                 + bucket
+                + ", indexType="
+                + indexType
                 + ", indexFile="
                 + indexFile
                 + '}';

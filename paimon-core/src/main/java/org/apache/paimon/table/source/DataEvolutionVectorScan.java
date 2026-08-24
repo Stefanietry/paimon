@@ -21,6 +21,9 @@ package org.apache.paimon.table.source;
 import org.apache.paimon.CoreOptions.GlobalIndexSearchMode;
 import org.apache.paimon.Snapshot;
 import org.apache.paimon.globalindex.DataEvolutionGlobalIndexCoverage;
+import org.apache.paimon.globalindex.GlobalIndexer;
+import org.apache.paimon.globalindex.GlobalIndexerFactoryUtils;
+import org.apache.paimon.globalindex.VectorGlobalIndexer;
 import org.apache.paimon.index.GlobalIndexMeta;
 import org.apache.paimon.index.IndexFileHandler;
 import org.apache.paimon.index.IndexFileMeta;
@@ -56,6 +59,8 @@ public class DataEvolutionVectorScan implements VectorScan {
     private final DataField vectorColumn;
     private final Map<String, String> options;
     @Nullable private final Snapshot pinnedSnapshot;
+    @Nullable private final float[][] queryVectors;
+    private final int limit;
 
     public DataEvolutionVectorScan(
             FileStoreTable table,
@@ -63,7 +68,7 @@ public class DataEvolutionVectorScan implements VectorScan {
             @Nullable Predicate filter,
             DataField vectorColumn,
             @Nullable Map<String, String> options) {
-        this(table, partitionFilter, filter, vectorColumn, options, null);
+        this(table, partitionFilter, filter, vectorColumn, options, null, (float[][]) null, 0);
     }
 
     public DataEvolutionVectorScan(
@@ -73,11 +78,53 @@ public class DataEvolutionVectorScan implements VectorScan {
             DataField vectorColumn,
             @Nullable Map<String, String> options,
             @Nullable Snapshot pinnedSnapshot) {
+        this(
+                table,
+                partitionFilter,
+                filter,
+                vectorColumn,
+                options,
+                pinnedSnapshot,
+                (float[][]) null,
+                0);
+    }
+
+    public DataEvolutionVectorScan(
+            FileStoreTable table,
+            @Nullable PartitionPredicate partitionFilter,
+            @Nullable Predicate filter,
+            DataField vectorColumn,
+            @Nullable Map<String, String> options,
+            @Nullable Snapshot pinnedSnapshot,
+            @Nullable float[] queryVector,
+            int limit) {
+        this(
+                table,
+                partitionFilter,
+                filter,
+                vectorColumn,
+                options,
+                pinnedSnapshot,
+                queryVector == null ? null : new float[][] {queryVector},
+                limit);
+    }
+
+    public DataEvolutionVectorScan(
+            FileStoreTable table,
+            @Nullable PartitionPredicate partitionFilter,
+            @Nullable Predicate filter,
+            DataField vectorColumn,
+            @Nullable Map<String, String> options,
+            @Nullable Snapshot pinnedSnapshot,
+            @Nullable float[][] queryVectors,
+            int limit) {
         this.table = table;
         this.partitionFilter = partitionFilter;
         this.filter = filter;
         this.vectorColumn = vectorColumn;
         this.pinnedSnapshot = pinnedSnapshot;
+        this.queryVectors = queryVectors;
+        this.limit = limit;
         this.options =
                 options == null
                         ? Collections.emptyMap()
@@ -88,36 +135,85 @@ public class DataEvolutionVectorScan implements VectorScan {
     public Plan scan() {
         Objects.requireNonNull(vectorColumn, "Vector column must be set");
 
-        Set<Integer> filterFieldIds = collectFieldIds(table.rowType(), filter);
-        @Nullable
-        Snapshot snapshot =
-                pinnedSnapshot != null ? pinnedSnapshot : TimeTravelUtil.tryTravelOrLatest(table);
+        @Nullable Snapshot snapshot = currentSnapshot();
         IndexFileHandler indexFileHandler = table.store().newIndexFileHandler();
-        Filter<IndexManifestEntry> indexFileFilter =
-                entry -> {
-                    if (partitionFilter != null && !partitionFilter.test(entry.partition())) {
-                        return false;
-                    }
-                    GlobalIndexMeta globalIndex = entry.indexFile().globalIndexMeta();
-                    if (globalIndex == null) {
-                        return false;
-                    }
-                    if (isPrimaryColumn(globalIndex, vectorColumn.id())) {
-                        return true;
-                    }
-                    for (int filterFieldId : filterFieldIds) {
-                        if (containsField(globalIndex, filterFieldId)) {
-                            return true;
-                        }
-                    }
-                    return false;
-                };
+        List<IndexManifestEntry> allIndexFileEntries =
+                scanCandidateGlobalIndexFileEntries(snapshot, indexFileHandler);
 
-        List<IndexFileMeta> allIndexFiles =
-                indexFileHandler.scan(snapshot, indexFileFilter).stream()
-                        .map(IndexManifestEntry::indexFile)
-                        .collect(Collectors.toList());
-        String vectorIndexType = vectorIndexType(allIndexFiles);
+        String indexType = resolveVectorIndexType(indexFiles(allIndexFileEntries));
+        VectorGlobalIndexer vectorGlobalIndexer = vectorGlobalIndexer(indexType);
+        IvfPqIndexFileRouter indexFileRouter =
+                new IvfPqIndexFileRouter(
+                        table,
+                        partitionFilter,
+                        filter,
+                        vectorColumn,
+                        options,
+                        queryVectors,
+                        limit,
+                        indexType,
+                        vectorGlobalIndexer);
+        List<IndexManifestEntry> searchableIndexFileEntries =
+                indexFileRouter.searchableIndexFileEntries(allIndexFileEntries);
+        List<IndexFileMeta> searchableIndexFiles = indexFiles(searchableIndexFileEntries);
+        List<IndexFileMeta> routedIndexFiles =
+                indexFileRouter.tryRouteIndexFiles(
+                        snapshot, indexFileHandler, searchableIndexFileEntries);
+        if (routedIndexFiles != null) {
+            return buildPlan(snapshot, routedIndexFiles, searchableIndexFiles, RawFallback.SKIPPED);
+        }
+        return buildPlan(snapshot, searchableIndexFiles, searchableIndexFiles, RawFallback.ENABLED);
+    }
+
+    @Nullable
+    private Snapshot currentSnapshot() {
+        return pinnedSnapshot != null ? pinnedSnapshot : TimeTravelUtil.tryTravelOrLatest(table);
+    }
+
+    private List<IndexManifestEntry> scanCandidateGlobalIndexFileEntries(
+            @Nullable Snapshot snapshot, IndexFileHandler indexFileHandler) {
+        return indexFileHandler.scan(snapshot, candidateGlobalIndexFileFilter());
+    }
+
+    private Filter<IndexManifestEntry> candidateGlobalIndexFileFilter() {
+        Set<Integer> filterFieldIds = collectFieldIds(table.rowType(), filter);
+        return entry -> isCandidateGlobalIndexEntry(entry, filterFieldIds);
+    }
+
+    private boolean isCandidateGlobalIndexEntry(
+            IndexManifestEntry entry, Set<Integer> filterFieldIds) {
+        if (partitionFilter != null && !partitionFilter.test(entry.partition())) {
+            return false;
+        }
+        GlobalIndexMeta globalIndex = entry.indexFile().globalIndexMeta();
+        return globalIndex != null && isCandidateGlobalIndex(globalIndex, filterFieldIds);
+    }
+
+    private boolean isCandidateGlobalIndex(
+            GlobalIndexMeta globalIndex, Set<Integer> filterFieldIds) {
+        if (isPrimaryColumn(globalIndex, vectorColumn.id())) {
+            return true;
+        }
+        for (int filterFieldId : filterFieldIds) {
+            if (containsField(globalIndex, filterFieldId)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    @Nullable
+    private String resolveVectorIndexType(List<IndexFileMeta> indexFiles) {
+        String indexType = vectorIndexType(indexFiles);
+        return indexType == null ? configuredVectorIndexType() : indexType;
+    }
+
+    private Plan buildPlan(
+            @Nullable Snapshot snapshot,
+            List<IndexFileMeta> vectorAndScalarCandidates,
+            List<IndexFileMeta> scalarCandidates,
+            RawFallback rawFallback) {
+        String vectorIndexType = vectorIndexType(vectorAndScalarCandidates);
         if (vectorIndexType == null) {
             vectorIndexType = configuredVectorIndexType();
         }
@@ -130,7 +226,7 @@ public class DataEvolutionVectorScan implements VectorScan {
         // results, but the ANN index is bypassed).
         Map<Range, List<IndexFileMeta>> vectorByRange = new HashMap<>();
         List<IndexFileMeta> vectorIndexFiles = new ArrayList<>();
-        for (IndexFileMeta indexFile : allIndexFiles) {
+        for (IndexFileMeta indexFile : vectorAndScalarCandidates) {
             GlobalIndexMeta meta = checkNotNull(indexFile.globalIndexMeta());
             if (isPrimaryColumn(meta, vectorColumn.id())) {
                 Range range = new Range(meta.rowRangeStart(), meta.rowRangeEnd());
@@ -145,7 +241,7 @@ public class DataEvolutionVectorScan implements VectorScan {
             Range range = entry.getKey();
             List<IndexFileMeta> vectorFiles = entry.getValue();
             List<IndexFileMeta> scalarFiles =
-                    allIndexFiles.stream()
+                    scalarCandidates.stream()
                             .filter(
                                     f -> {
                                         GlobalIndexMeta globalIndex =
@@ -157,6 +253,10 @@ public class DataEvolutionVectorScan implements VectorScan {
                                     })
                             .collect(Collectors.toList());
             splits.add(new IndexVectorSearchSplit(range.from, range.to, vectorFiles, scalarFiles));
+        }
+
+        if (rawFallback == RawFallback.SKIPPED) {
+            return plan(snapshot, splits);
         }
 
         GlobalIndexSearchMode vectorSearchMode = table.coreOptions().vectorIndexSearchMode();
@@ -174,7 +274,7 @@ public class DataEvolutionVectorScan implements VectorScan {
                                     table,
                                     snapshot,
                                     partitionFilter,
-                                    scalarIndexFiles(allIndexFiles),
+                                    scalarIndexFiles(scalarCandidates),
                                     table.coreOptions().scalarIndexSearchMode())
                             .unindexedRanges(table.rowType(), filter);
             if (vectorSearchMode == GlobalIndexSearchMode.FAST) {
@@ -191,10 +291,19 @@ public class DataEvolutionVectorScan implements VectorScan {
             splits.add(
                     new RawVectorSearchSplit(
                             rawRowRanges,
-                            scalarIndexFiles(allIndexFiles, rawRowRanges),
+                            scalarIndexFiles(scalarCandidates, rawRowRanges),
                             vectorIndexType));
         }
 
+        return plan(snapshot, splits);
+    }
+
+    private enum RawFallback {
+        ENABLED,
+        SKIPPED
+    }
+
+    private Plan plan(@Nullable Snapshot snapshot, List<VectorSearchSplit> splits) {
         @Nullable Snapshot planSnapshot = snapshot;
         return new Plan() {
             @Override
@@ -207,6 +316,23 @@ public class DataEvolutionVectorScan implements VectorScan {
                 return planSnapshot;
             }
         };
+    }
+
+    private static List<IndexFileMeta> indexFiles(List<IndexManifestEntry> entries) {
+        return entries.stream().map(IndexManifestEntry::indexFile).collect(Collectors.toList());
+    }
+
+    @Nullable
+    private VectorGlobalIndexer vectorGlobalIndexer(@Nullable String indexType) {
+        if (indexType == null) {
+            return null;
+        }
+        GlobalIndexer globalIndexer =
+                GlobalIndexerFactoryUtils.load(indexType)
+                        .create(vectorColumn, table.coreOptions().toConfiguration());
+        return globalIndexer instanceof VectorGlobalIndexer
+                ? (VectorGlobalIndexer) globalIndexer
+                : null;
     }
 
     private static boolean isPrimaryColumn(GlobalIndexMeta meta, int fieldId) {
