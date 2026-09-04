@@ -18,13 +18,29 @@
 
 package org.apache.paimon.vector.index;
 
-/** Factory for the {@code ivf-rq} vector index identifier. */
-public class IvfRqVectorGlobalIndexerFactory extends NativeVectorGlobalIndexerFactory {
+/** Row id encoding used in vector index files. */
+public enum RowIdEncoding {
+    ABSOLUTE_ROW_ID("absolute-row-id");
 
-    public static final String IDENTIFIER = NativeVectorIndexOptions.IVF_RQ_INDEX_TYPE;
+    private final String value;
 
-    @Override
-    public String identifier() {
-        return IDENTIFIER;
+    RowIdEncoding(String value) {
+        this.value = value;
+    }
+
+    public String value() {
+        return value;
+    }
+
+    public static RowIdEncoding fromValue(String value) {
+        if (value == null) {
+            return null;
+        }
+        for (RowIdEncoding encoding : values()) {
+            if (encoding.value.equals(value)) {
+                return encoding;
+            }
+        }
+        throw new IllegalArgumentException("Unsupported row id encoding: " + value);
     }
 }

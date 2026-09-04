@@ -18,13 +18,24 @@
 
 package org.apache.paimon.vector.index;
 
-/** Factory for the {@code ivf-rq} vector index identifier. */
-public class IvfRqVectorGlobalIndexerFactory extends NativeVectorGlobalIndexerFactory {
+import java.io.IOException;
+import java.util.Collections;
+import java.util.Map;
+import java.util.Set;
 
-    public static final String IDENTIFIER = NativeVectorIndexOptions.IVF_RQ_INDEX_TYPE;
+/** Provider for vector training model trainers and persisted model loading. */
+public interface VectorTrainingModelProvider {
 
-    @Override
-    public String identifier() {
-        return IDENTIFIER;
+    /** Returns all vector index types supported by this provider. */
+    default Set<String> supportedIndexTypes() {
+        return Collections.singleton(identifier());
     }
+
+    /** Returns the provider's primary index type identifier. */
+    String identifier();
+
+    VectorGlobalModelTrainer createTrainer(String indexType, Map<String, String> options);
+
+    VectorTrainingModel loadModel(String indexType, Map<String, String> options, byte[] payload)
+            throws IOException;
 }

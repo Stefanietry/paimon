@@ -18,13 +18,12 @@
 
 package org.apache.paimon.vector.index;
 
-/** Factory for the {@code ivf-rq} vector index identifier. */
-public class IvfRqVectorGlobalIndexerFactory extends NativeVectorGlobalIndexerFactory {
+/** IVF routing model used by centroid assignment and query routing. */
+public interface IvfRoutingModel {
 
-    public static final String IDENTIFIER = NativeVectorIndexOptions.IVF_RQ_INDEX_TYPE;
+    int nlist();
 
-    @Override
-    public String identifier() {
-        return IDENTIFIER;
-    }
+    int assignCentroid(float[] vector);
+
+    int[] nearestCentroids(float[] queryVector, int nprobe);
 }

@@ -23,6 +23,7 @@ import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.PositionOutputStream;
 import org.apache.paimon.fs.local.LocalFileIO;
 import org.apache.paimon.globalindex.GlobalIndexIOMeta;
+import org.apache.paimon.globalindex.IvfShard;
 import org.apache.paimon.globalindex.ResultEntry;
 import org.apache.paimon.globalindex.ScoredGlobalIndexResult;
 import org.apache.paimon.globalindex.io.GlobalIndexFileReader;
@@ -235,6 +236,37 @@ public class NativeVectorGlobalIndexTest {
 
         assertThat(new String(serialized, StandardCharsets.UTF_8)).isEqualTo("{}");
         assertThat(new String(deserialized.serialize(), StandardCharsets.UTF_8)).isEqualTo("{}");
+    }
+
+    @Test
+    public void testCentroidRoutingModelMetaSerialization() throws IOException {
+        VectorIndexMeta routingModel =
+                VectorIndexMeta.deserialize(VectorIndexMeta.centroidRoutingModel().serialize());
+        assertThat(routingModel.shardMode()).isEqualTo(IvfShard.CENTROID_BASED);
+        assertThat(routingModel.isCentroidShard()).isFalse();
+        assertThat(routingModel.centroid()).isNull();
+        assertThat(routingModel.rowIdEncoding()).isNull();
+    }
+
+    @Test
+    public void testCentroidShardMetaSerialization() throws IOException {
+        VectorIndexMeta centroidShard =
+                VectorIndexMeta.deserialize(VectorIndexMeta.centroidShard(3).serialize());
+        assertThat(centroidShard.shardMode()).isEqualTo(IvfShard.CENTROID_BASED);
+        assertThat(centroidShard.isCentroidShard()).isTrue();
+        assertThat(centroidShard.centroid()).isEqualTo(3);
+        assertThat(centroidShard.rowIdEncoding()).isEqualTo(RowIdEncoding.ABSOLUTE_ROW_ID);
+    }
+
+    @Test
+    public void testInvalidExplicitShardModeIsRejected() {
+        assertThatThrownBy(
+                        () ->
+                                VectorIndexMeta.deserialize(
+                                        "{\"shardMode\":\"unknown\"}"
+                                                .getBytes(StandardCharsets.UTF_8)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Unsupported vector index shard mode");
     }
 
     @Test

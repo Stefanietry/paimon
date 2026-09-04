@@ -18,13 +18,13 @@
 
 package org.apache.paimon.vector.index;
 
-/** Factory for the {@code ivf-rq} vector index identifier. */
-public class IvfRqVectorGlobalIndexerFactory extends NativeVectorGlobalIndexerFactory {
+import java.io.Closeable;
+import java.io.IOException;
+import java.io.OutputStream;
 
-    public static final String IDENTIFIER = NativeVectorIndexOptions.IVF_RQ_INDEX_TYPE;
+/** Persistable vector training model. */
+public interface VectorTrainingModel extends Closeable {
 
-    @Override
-    public String identifier() {
-        return IDENTIFIER;
-    }
+    /** Serializes this training model for persisted query-side routing. */
+    void serializeTo(OutputStream out) throws IOException;
 }

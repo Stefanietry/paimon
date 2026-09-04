@@ -21,7 +21,7 @@ package org.apache.paimon.vector.index;
 /** Factory for the {@code ivf-pq} vector index identifier. */
 public class IvfPqAlgorithmVectorGlobalIndexerFactory extends NativeVectorGlobalIndexerFactory {
 
-    public static final String IDENTIFIER = "ivf-pq";
+    public static final String IDENTIFIER = NativeVectorIndexOptions.IVF_PQ_INDEX_TYPE;
 
     @Override
     public String identifier() {

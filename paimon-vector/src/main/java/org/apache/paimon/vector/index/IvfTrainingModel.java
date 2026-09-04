@@ -18,13 +18,16 @@
 
 package org.apache.paimon.vector.index;
 
-/** Factory for the {@code ivf-rq} vector index identifier. */
-public class IvfRqVectorGlobalIndexerFactory extends NativeVectorGlobalIndexerFactory {
+import org.apache.paimon.globalindex.GlobalIndexSingleColumnWriter;
+import org.apache.paimon.globalindex.io.GlobalIndexFileWriter;
 
-    public static final String IDENTIFIER = NativeVectorIndexOptions.IVF_RQ_INDEX_TYPE;
+/** Persistable IVF training model used for centroid routing and shard writing. */
+public interface IvfTrainingModel extends VectorTrainingModel {
 
-    @Override
-    public String identifier() {
-        return IDENTIFIER;
-    }
+    /** Returns the IVF routing model used for build-side assignment and query-side routing. */
+    IvfRoutingModel routingModel();
+
+    /** Creates a physical index writer for vectors assigned to one centroid shard. */
+    GlobalIndexSingleColumnWriter createCentroidShardIndexWriter(
+            GlobalIndexFileWriter fileWriter, int centroid);
 }

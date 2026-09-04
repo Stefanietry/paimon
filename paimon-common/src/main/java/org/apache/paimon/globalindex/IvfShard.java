@@ -16,15 +16,36 @@
  * limitations under the License.
  */
 
-package org.apache.paimon.vector.index;
+package org.apache.paimon.globalindex;
 
-/** Factory for the {@code ivf-rq} vector index identifier. */
-public class IvfRqVectorGlobalIndexerFactory extends NativeVectorGlobalIndexerFactory {
+import javax.annotation.Nullable;
 
-    public static final String IDENTIFIER = NativeVectorIndexOptions.IVF_RQ_INDEX_TYPE;
+/** Explicit sharding modes for IVF global indexes. */
+public enum IvfShard {
+    CENTROID_BASED("centroid-based");
 
-    @Override
-    public String identifier() {
-        return IDENTIFIER;
+    private final String optionValue;
+
+    IvfShard(String optionValue) {
+        this.optionValue = optionValue;
+    }
+
+    public String optionValue() {
+        return optionValue;
+    }
+
+    @Nullable
+    public static IvfShard fromValue(@Nullable String value) {
+        if (value == null || value.isEmpty()) {
+            return null;
+        }
+        if (CENTROID_BASED.matches(value)) {
+            return CENTROID_BASED;
+        }
+        return null;
+    }
+
+    private boolean matches(String value) {
+        return optionValue.equals(value) || name().equals(value);
     }
 }
