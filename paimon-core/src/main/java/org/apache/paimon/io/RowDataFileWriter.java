@@ -18,6 +18,7 @@
 
 package org.apache.paimon.io;
 
+import org.apache.paimon.blob.BlobDescriptorFieldExternalizer;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.fileindex.FileIndexOptions;
 import org.apache.paimon.format.FileFormat;
@@ -38,6 +39,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
@@ -56,6 +58,7 @@ public class RowDataFileWriter extends StatsCollectingSingleFileWriter<InternalR
     private final FileSource fileSource;
     @Nullable private final List<String> writeCols;
     private final RowDataFileSequenceNumberTracker sequenceNumberTracker;
+    @Nullable private final BlobDescriptorFieldExternalizer blobDescriptorFieldExternalizer;
 
     public RowDataFileWriter(
             FileIO fileIO,
@@ -72,6 +75,46 @@ public class RowDataFileWriter extends StatsCollectingSingleFileWriter<InternalR
             @Nullable List<String> writeCols,
             @Nullable FileFormat rowSidecarFormat,
             @Nullable Path rowSidecarPath) {
+        this(
+                fileIO,
+                context,
+                path,
+                writeSchema,
+                schemaId,
+                seqNumCounterSupplier,
+                fileIndexOptions,
+                fileSource,
+                asyncFileWrite,
+                statsDenseStore,
+                isExternalPath,
+                writeCols,
+                rowSidecarFormat,
+                rowSidecarPath,
+                Collections.emptySet(),
+                null,
+                0L,
+                0);
+    }
+
+    public RowDataFileWriter(
+            FileIO fileIO,
+            FileWriterContext context,
+            Path path,
+            RowType writeSchema,
+            long schemaId,
+            Supplier<LongCounter> seqNumCounterSupplier,
+            FileIndexOptions fileIndexOptions,
+            FileSource fileSource,
+            boolean asyncFileWrite,
+            boolean statsDenseStore,
+            boolean isExternalPath,
+            @Nullable List<String> writeCols,
+            @Nullable FileFormat rowSidecarFormat,
+            @Nullable Path rowSidecarPath,
+            Set<String> blobDescriptorFields,
+            @Nullable DataFilePathFactory pathFactory,
+            long blobTargetFileSize,
+            int blobCopyBufferSize) {
         super(fileIO, context, path, Function.identity(), writeSchema, asyncFileWrite);
         if ((rowSidecarFormat == null) != (rowSidecarPath == null)) {
             throw new IllegalArgumentException(
@@ -103,20 +146,42 @@ public class RowDataFileWriter extends StatsCollectingSingleFileWriter<InternalR
         this.sequenceNumberTracker =
                 new RowDataFileSequenceNumberTracker(
                         writeSchema, seqNumCounterSupplier, super::recordCount);
+        if (blobDescriptorFields.isEmpty()) {
+            this.blobDescriptorFieldExternalizer = null;
+        } else {
+            if (pathFactory == null) {
+                throw new IllegalArgumentException(
+                        "Path factory must not be null when blob descriptor fields are configured.");
+            }
+            this.blobDescriptorFieldExternalizer =
+                    new BlobDescriptorFieldExternalizer(
+                            fileIO,
+                            path,
+                            writeSchema,
+                            blobDescriptorFields,
+                            pathFactory,
+                            blobTargetFileSize,
+                            blobCopyBufferSize);
+        }
     }
 
     @Override
     public void write(InternalRow row) throws IOException {
-        super.write(row);
+        InternalRow writtenRow =
+                blobDescriptorFieldExternalizer == null
+                        ? row
+                        : blobDescriptorFieldExternalizer.externalize(row);
+        super.write(writtenRow);
         for (DataFileAuxiliaryWriter auxiliaryFileWriter : auxiliaryFileWriters) {
-            auxiliaryFileWriter.write(row);
+            auxiliaryFileWriter.write(writtenRow);
         }
-        sequenceNumberTracker.update(row);
+        sequenceNumberTracker.update(writtenRow);
     }
 
     @Override
     public void writeBundle(BundleRecords bundle) throws IOException {
         if (auxiliaryFileWriters.isEmpty()
+                && blobDescriptorFieldExternalizer == null
                 && sequenceNumberTracker.supportsRowCountUpdate()
                 && !requiresPerRecordStats()) {
             long rowCount = bundle.rowCount();
@@ -132,14 +197,25 @@ public class RowDataFileWriter extends StatsCollectingSingleFileWriter<InternalR
 
     @Override
     public void close() throws IOException {
-        for (DataFileAuxiliaryWriter auxiliaryFileWriter : auxiliaryFileWriters) {
-            auxiliaryFileWriter.close();
+        try {
+            for (DataFileAuxiliaryWriter auxiliaryFileWriter : auxiliaryFileWriters) {
+                auxiliaryFileWriter.close();
+            }
+            if (blobDescriptorFieldExternalizer != null) {
+                blobDescriptorFieldExternalizer.close();
+            }
+            super.close();
+        } catch (IOException e) {
+            abort();
+            throw e;
         }
-        super.close();
     }
 
     @Override
     public void abort() {
+        if (blobDescriptorFieldExternalizer != null) {
+            blobDescriptorFieldExternalizer.abort();
+        }
         for (DataFileAuxiliaryWriter auxiliaryFileWriter : auxiliaryFileWriters) {
             auxiliaryFileWriter.abort();
         }
@@ -149,7 +225,7 @@ public class RowDataFileWriter extends StatsCollectingSingleFileWriter<InternalR
     @Override
     public Optional<FileWriterAbortExecutor> abortExecutor() {
         Optional<FileWriterAbortExecutor> mainAbortExecutor = super.abortExecutor();
-        if (auxiliaryFileWriters.isEmpty()) {
+        if (auxiliaryFileWriters.isEmpty() && blobDescriptorFieldExternalizer == null) {
             return mainAbortExecutor;
         }
 
@@ -157,6 +233,9 @@ public class RowDataFileWriter extends StatsCollectingSingleFileWriter<InternalR
         mainAbortExecutor.ifPresent(abortExecutors::add);
         for (DataFileAuxiliaryWriter auxiliaryFileWriter : auxiliaryFileWriters) {
             auxiliaryFileWriter.abortExecutor().ifPresent(abortExecutors::add);
+        }
+        if (blobDescriptorFieldExternalizer != null) {
+            abortExecutors.add(blobDescriptorFieldExternalizer.abortExecutor());
         }
         if (abortExecutors.isEmpty()) {
             return Optional.empty();
@@ -182,6 +261,12 @@ public class RowDataFileWriter extends StatsCollectingSingleFileWriter<InternalR
                     throw new IOException("Found more than one embedded index for one data file.");
                 }
                 embeddedIndex = auxiliaryResult.embeddedIndexBytes();
+            }
+        }
+        if (blobDescriptorFieldExternalizer != null) {
+            String sidecar = blobDescriptorFieldExternalizer.result();
+            if (sidecar != null) {
+                extraFiles.add(sidecar);
             }
         }
         String externalPath = isExternalPath ? path.toString() : null;

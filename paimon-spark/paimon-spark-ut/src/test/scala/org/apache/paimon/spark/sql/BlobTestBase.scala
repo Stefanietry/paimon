@@ -905,6 +905,34 @@ class BlobTestBase extends PaimonSparkTestBase {
     }
   }
 
+  test("Blob: descriptor field accepts raw blob data") {
+    withTable("t") {
+      val blobData = Array[Byte](72, 101, 108, 108, 111)
+      sql(
+        "CREATE TABLE t (id INT, picture BINARY) TBLPROPERTIES " +
+          "('row-tracking.enabled'='true', 'data-evolution.enabled'='true', " +
+          "'blob-descriptor-field'='picture')")
+
+      sql("INSERT INTO t VALUES (1, X'48656C6C6F')")
+
+      checkAnswer(
+        sql("SELECT id, picture FROM t"),
+        Seq(Row(1, blobData))
+      )
+
+      sql("ALTER TABLE t SET TBLPROPERTIES ('blob-as-descriptor'='true')")
+      val descriptorBytes =
+        sql("SELECT picture FROM t WHERE id = 1").collect()(0).getAs[Array[Byte]](0)
+      val descriptor = BlobDescriptor.deserialize(descriptorBytes)
+      val options = new Options()
+      options.set("warehouse", tempDBDir.toString)
+      val catalogContext = CatalogContext.create(options)
+      val blob =
+        Blob.fromDescriptor(new UriReaderFactory(catalogContext).create(descriptor.uri), descriptor)
+      assert(util.Arrays.equals(blobData, blob.toData))
+    }
+  }
+
   private val HEX_ARRAY = "0123456789ABCDEF".toCharArray
 
   def bytesToHex(bytes: Array[Byte]): String = {

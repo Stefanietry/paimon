@@ -198,7 +198,10 @@ public class DedicatedFormatRollingFileWriter
                             fileSource,
                             asyncFileWrite,
                             statsDenseStore,
-                            omitAllNonDedicatedWriteCols);
+                            omitAllNonDedicatedWriteCols,
+                            context == null ? Collections.emptySet() : context.blobDescriptorFields(),
+                            blobTargetFileSize,
+                            context == null ? 0 : context.copyBufferSize());
         }
 
         if (context != null) {
@@ -263,7 +266,10 @@ public class DedicatedFormatRollingFileWriter
                     FileSource fileSource,
                     boolean asyncFileWrite,
                     boolean statsDenseStore,
-                    boolean omitAllNonDedicatedWriteCols) {
+                    boolean omitAllNonDedicatedWriteCols,
+                    Set<String> blobDescriptorFields,
+                    long blobTargetFileSize,
+                    int blobCopyBufferSize) {
         RowType normalRowType = new RowType(fieldsInNormalFile);
         List<String> normalColumnNames = normalRowType.getFieldNames();
         int[] projectionNormalFields = writeSchema.projectIndexes(normalColumnNames);
@@ -288,7 +294,11 @@ public class DedicatedFormatRollingFileWriter
                             pathFactory.isExternalPath(),
                             omitAllNonDedicatedWriteCols ? null : normalColumnNames,
                             null,
-                            null);
+                            null,
+                            blobDescriptorFields,
+                            pathFactory,
+                            blobTargetFileSize,
+                            blobCopyBufferSize);
             return new ProjectedFileWriter<>(rowDataFileWriter, projectionNormalFields);
         };
     }

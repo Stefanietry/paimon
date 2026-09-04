@@ -65,13 +65,18 @@ public class BlobFileContext {
         Set<String> descriptorFields = options.blobDescriptorField();
         Set<String> inlineFields = options.blobInlineField();
         boolean requireBlobFile = false;
+        boolean requireDescriptorFieldExternalize = false;
         for (DataField field : rowType.getFields()) {
-            if (BlobType.isBlobFileField(field.type()) && !inlineFields.contains(field.name())) {
-                requireBlobFile = true;
-                break;
+            if (BlobType.isBlobFileField(field.type())) {
+                if (descriptorFields.contains(field.name())) {
+                    requireDescriptorFieldExternalize = true;
+                } else if (!inlineFields.contains(field.name())) {
+                    requireBlobFile = true;
+                    break;
+                }
             }
         }
-        if (!requireBlobFile) {
+        if (!requireBlobFile && !requireDescriptorFieldExternalize) {
             return null;
         }
         return new BlobFileContext(
