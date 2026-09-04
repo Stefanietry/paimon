@@ -25,6 +25,7 @@ import org.apache.paimon.fs.Path;
 import org.apache.paimon.globalindex.DataEvolutionGlobalIndexRefreshPlanner;
 import org.apache.paimon.globalindex.GlobalIndexBuilderUtils;
 import org.apache.paimon.globalindex.IndexedSplit;
+import org.apache.paimon.globalindex.IvfShard;
 import org.apache.paimon.index.DataEvolutionIndexSourceMeta;
 import org.apache.paimon.io.CompactIncrement;
 import org.apache.paimon.io.DataIncrement;
@@ -64,6 +65,8 @@ import static org.apache.paimon.CoreOptions.GLOBAL_INDEX_COLUMN_UPDATE_ACTION;
 import static org.apache.paimon.CoreOptions.GLOBAL_INDEX_ROW_COUNT_PER_SHARD;
 import static org.apache.paimon.CoreOptions.GlobalIndexColumnUpdateAction.IGNORE;
 import static org.apache.paimon.utils.Preconditions.checkArgument;
+import static org.apache.paimon.vector.index.NativeVectorIndexOptions.IVF_SHARD_OPTION;
+import static org.apache.paimon.vector.index.NativeVectorIndexOptions.isIvfIndexType;
 
 /** Default topology builder. */
 public class DefaultGlobalIndexTopoBuilder implements GlobalIndexTopologyBuilder {
@@ -103,6 +106,26 @@ public class DefaultGlobalIndexTopoBuilder implements GlobalIndexTopologyBuilder
             List<DataField> extraFields,
             Options options)
             throws IOException {
+        IvfShard ivfShard = IvfShard.fromValue(options.get(IVF_SHARD_OPTION));
+        if (ivfShard == IvfShard.CENTROID_BASED) {
+            checkArgument(
+                    isIvfIndexType(indexType),
+                    "Option '%s=%s' is only supported for IVF index types, but was '%s'.",
+                    IVF_SHARD_OPTION,
+                    IvfShard.CENTROID_BASED.optionValue(),
+                    indexType);
+            return new CentroidShardedIvfIndexTopoBuilder()
+                    .buildIndex(
+                            spark,
+                            partitionPredicate,
+                            table,
+                            indexType,
+                            readType,
+                            indexField,
+                            extraFields,
+                            options);
+        }
+
         long rowsPerShard = rowsPerShard(options);
 
         Snapshot snapshot = table.snapshotManager().latestSnapshot();

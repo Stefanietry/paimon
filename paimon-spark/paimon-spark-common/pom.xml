@@ -65,6 +65,12 @@ under the License.
         </dependency>
 
         <dependency>
+            <groupId>org.apache.paimon</groupId>
+            <artifactId>paimon-vector</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+
+        <dependency>
             <groupId>org.antlr</groupId>
             <artifactId>antlr4-runtime</artifactId>
             <version>${antlr4.version}</version>
@@ -87,6 +93,8 @@ under the License.
                             <artifactSet>
                                 <includes combine.children="append">
                                     <include>org.apache.paimon:paimon-bundle</include>
+                                    <include>org.apache.paimon:paimon-vector</include>
+                                    <include>org.apache.paimon:paimon-vector-index-java</include>
                                 </includes>
                             </artifactSet>
                         </configuration>
