@@ -23,6 +23,7 @@ import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.PositionOutputStream;
 import org.apache.paimon.fs.local.LocalFileIO;
 import org.apache.paimon.globalindex.GlobalIndexIOMeta;
+import org.apache.paimon.globalindex.IndexFileKind;
 import org.apache.paimon.globalindex.IvfShard;
 import org.apache.paimon.globalindex.ResultEntry;
 import org.apache.paimon.globalindex.ScoredGlobalIndexResult;
@@ -267,6 +268,29 @@ public class NativeVectorGlobalIndexTest {
                                                 .getBytes(StandardCharsets.UTF_8)))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Unsupported vector index shard mode");
+    }
+
+    @Test
+    public void testCentroidRoutingRejectsMultipleRootFilesInOnePartition() throws IOException {
+        assertThatThrownBy(
+                        () ->
+                                CentroidRoutedIndexFileLayout.tryCreate(
+                                        null,
+                                        java.util.Arrays.asList(
+                                                new GlobalIndexIOMeta(
+                                                        new Path(indexPath, "global-index-1"),
+                                                        0L,
+                                                        VectorIndexMeta.centroidRoutingModel()
+                                                                .serialize(),
+                                                        IndexFileKind.ROUTING_MODEL),
+                                                new GlobalIndexIOMeta(
+                                                        new Path(indexPath, "global-index-2"),
+                                                        0L,
+                                                        VectorIndexMeta.centroidRoutingModel()
+                                                                .serialize(),
+                                                        IndexFileKind.ROUTING_MODEL))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("only one global index file per partition");
     }
 
     @Test
@@ -814,6 +838,7 @@ public class NativeVectorGlobalIndexTest {
         ResultEntry result = results.get(0);
         Path filePath = new Path(path, result.fileName());
         return Collections.singletonList(
-                new GlobalIndexIOMeta(filePath, fileIO.getFileSize(filePath), result.meta()));
+                new GlobalIndexIOMeta(
+                        filePath, fileIO.getFileSize(filePath), result.meta(), result.fileKind()));
     }
 }

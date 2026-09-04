@@ -45,6 +45,7 @@ import org.apache.paimon.utils.RoaringNavigableMap64;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
@@ -136,11 +137,41 @@ public class NativeVectorGlobalIndexReader implements GlobalIndexReader {
 
     private List<Optional<ScoredGlobalIndexResult>> searchBatch(BatchVectorSearch batchVectorSearch)
             throws IOException {
+        return searchBatch(
+                batchVectorSearch,
+                vectorSearch -> Optional.ofNullable(search(vectorSearch)),
+                (queries, queryCount, searchParams, filterBytes) ->
+                        filterBytes != null
+                                ? vectorReader.searchBatch(
+                                        queries, queryCount, searchParams, filterBytes)
+                                : vectorReader.searchBatch(queries, queryCount, searchParams));
+    }
+
+    List<Optional<ScoredGlobalIndexResult>> searchCentroidShardBatch(
+            BatchVectorSearch batchVectorSearch, int centroid)
+            throws IOException {
+        ensureLoaded();
+        return searchBatch(
+                batchVectorSearch,
+                vectorSearch -> searchCentroidShard(vectorSearch, centroid),
+                (queries, queryCount, searchParams, filterBytes) ->
+                        filterBytes != null
+                                ? searchRoutedIvfShardBatch(
+                                        queries, queryCount, searchParams, centroid, filterBytes)
+                                : searchRoutedIvfShardBatch(
+                                        queries, queryCount, searchParams, centroid));
+    }
+
+    private List<Optional<ScoredGlobalIndexResult>> searchBatch(
+            BatchVectorSearch batchVectorSearch,
+            SingleVectorSearch singleSearch,
+            BatchVectorSearchExecutor batchSearch)
+            throws IOException {
         int n = batchVectorSearch.vectorCount();
         // Single vector: reuse the scalar path; no batching benefit.
         if (n == 1) {
             List<Optional<ScoredGlobalIndexResult>> results = new ArrayList<>(1);
-            results.add(Optional.ofNullable(search(batchVectorSearch.forIndex(0))));
+            results.add(singleSearch.search(batchVectorSearch.forIndex(0)));
             return results;
         }
 
@@ -160,15 +191,10 @@ public class NativeVectorGlobalIndexReader implements GlobalIndexReader {
                 batchSearchParams(batchVectorSearch.options(), scope.effectiveK);
 
         // Flatten query vectors into one contiguous array for a single native call.
-        float[] queries = new float[n * dim];
-        for (int i = 0; i < n; i++) {
-            System.arraycopy(vectors[i], 0, queries, i * dim, dim);
-        }
+        float[] queries = flattenVectors(vectors, n, dim);
 
         VectorSearchBatchResult batchResult =
-                scope.filterBytes != null
-                        ? vectorReader.searchBatch(queries, n, searchParams, scope.filterBytes)
-                        : vectorReader.searchBatch(queries, n, searchParams);
+                batchSearch.search(queries, n, searchParams, scope.filterBytes);
 
         // result i corresponds to vectors[i], matching input order.
         List<Optional<ScoredGlobalIndexResult>> results = new ArrayList<>(n);
@@ -201,6 +227,67 @@ public class NativeVectorGlobalIndexReader implements GlobalIndexReader {
                                 searchParams(vectorSearch.options(), scope.effectiveK));
 
         return buildScoredResult(result.ids(), result.distances(), metric).orElse(null);
+    }
+
+    Optional<ScoredGlobalIndexResult> searchCentroidShard(VectorSearch vectorSearch, int centroid)
+            throws IOException {
+        ensureLoaded();
+        validateSearchVector(vectorSearch.vector());
+        float[] queryVector = vectorSearch.vector().clone();
+        String metric = nativeMeta.metric();
+
+        SearchScope scope = resolveScope(vectorSearch.includeRowIds(), vectorSearch.limit());
+        if (scope == null) {
+            return Optional.empty();
+        }
+
+        VectorSearchParams params = searchParams(vectorSearch.options(), scope.effectiveK);
+        VectorSearchResult result =
+                scope.filterBytes != null
+                        ? searchRoutedIvfShard(queryVector, params, centroid, scope.filterBytes)
+                        : searchRoutedIvfShard(queryVector, params, centroid);
+        return buildScoredResult(result.ids(), result.distances(), metric);
+    }
+
+    private VectorSearchResult searchRoutedIvfShard(
+            float[] queryVector, VectorSearchParams params, int centroid) {
+        // TODO: Call VectorIndexReader#searchRoutedIvfShard(float[], VectorSearchParams, int)
+        // directly after paimon-vector-index-java exposes the routed IVF shard search API.
+        throw unsupportedRoutedIvfShardSearch();
+    }
+
+    private VectorSearchResult searchRoutedIvfShard(
+            float[] queryVector, VectorSearchParams params, int centroid, byte[] filterBytes) {
+        // TODO: Call VectorIndexReader#searchRoutedIvfShard(
+        // float[], VectorSearchParams, int, byte[]) directly after paimon-vector-index-java
+        // exposes the routed IVF shard search API.
+        throw unsupportedRoutedIvfShardSearch();
+    }
+
+    private VectorSearchBatchResult searchRoutedIvfShardBatch(
+            float[] queryVectors, int queryCount, VectorSearchParams params, int centroid) {
+        // TODO: Call VectorIndexReader#searchRoutedIvfShardBatch(
+        // float[], int, VectorSearchParams, int) directly after paimon-vector-index-java exposes
+        // the routed IVF shard batch search API.
+        throw unsupportedRoutedIvfShardSearch();
+    }
+
+    private VectorSearchBatchResult searchRoutedIvfShardBatch(
+            float[] queryVectors,
+            int queryCount,
+            VectorSearchParams params,
+            int centroid,
+            byte[] filterBytes) {
+        // TODO: Call VectorIndexReader#searchRoutedIvfShardBatch(
+        // float[], int, VectorSearchParams, int, byte[]) directly after paimon-vector-index-java
+        // exposes the routed IVF shard batch search API.
+        throw unsupportedRoutedIvfShardSearch();
+    }
+
+    private static UnsupportedOperationException unsupportedRoutedIvfShardSearch() {
+        return new UnsupportedOperationException(
+                "Routed IVF shard search requires native VectorIndexReader APIs: "
+                        + "searchRoutedIvfShard(...) and searchRoutedIvfShardBatch(...).");
     }
 
     static Optional<ScoredGlobalIndexResult> buildScoredResult(
@@ -241,6 +328,14 @@ public class NativeVectorGlobalIndexReader implements GlobalIndexReader {
                         }));
     }
 
+    private static float[] flattenVectors(float[][] vectors, int vectorCount, int dimension) {
+        float[] queries = new float[vectorCount * dimension];
+        for (int i = 0; i < vectorCount; i++) {
+            System.arraycopy(vectors[i], 0, queries, i * dimension, dimension);
+        }
+        return queries;
+    }
+
     private static List<Optional<ScoredGlobalIndexResult>> emptyResults(int n) {
         List<Optional<ScoredGlobalIndexResult>> results = new ArrayList<>(n);
         for (int i = 0; i < n; i++) {
@@ -273,6 +368,21 @@ public class NativeVectorGlobalIndexReader implements GlobalIndexReader {
         }
     }
 
+    private interface SingleVectorSearch {
+
+        Optional<ScoredGlobalIndexResult> search(VectorSearch vectorSearch) throws IOException;
+    }
+
+    private interface BatchVectorSearchExecutor {
+
+        VectorSearchBatchResult search(
+                        float[] queryVectors,
+                        int queryCount,
+                        VectorSearchParams searchParams,
+                        byte[] filterBytes)
+                throws IOException;
+    }
+
     private static float convertDistanceToScore(float distance, String metric) {
         if ("l2".equals(metric)) {
             return 1.0f / (1.0f + distance);
@@ -285,6 +395,9 @@ public class NativeVectorGlobalIndexReader implements GlobalIndexReader {
     }
 
     static VectorSearchParams searchParams(Map<String, String> parameters, int topK) {
+        if (parameters == null) {
+            parameters = Collections.emptyMap();
+        }
         Integer nprobe = intParameter(parameters, NPROBE_PARAMETER);
         Integer lSearch = intParameter(parameters, L_SEARCH_PARAMETER);
         Integer maxInitialFilterExpansionFactor =
