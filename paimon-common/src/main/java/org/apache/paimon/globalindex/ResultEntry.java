@@ -18,6 +18,8 @@
 
 package org.apache.paimon.globalindex;
 
+import org.apache.paimon.utils.Range;
+
 import javax.annotation.Nullable;
 
 /** Write result meta. */
@@ -30,10 +32,25 @@ public class ResultEntry {
 
     @Nullable private final byte[] meta;
 
+    @Nullable private final IndexFileKind fileKind;
+
+    @Nullable private final Range rowRange;
+
     public ResultEntry(String fileName, long rowCount, @Nullable byte[] meta) {
+        this(fileName, rowCount, meta, null, null);
+    }
+
+    public ResultEntry(
+            String fileName,
+            long rowCount,
+            @Nullable byte[] meta,
+            @Nullable IndexFileKind fileKind,
+            @Nullable Range rowRange) {
         this.fileName = fileName;
         this.rowCount = rowCount;
         this.meta = meta;
+        this.fileKind = fileKind;
+        this.rowRange = rowRange;
     }
 
     public String fileName() {
@@ -46,5 +63,15 @@ public class ResultEntry {
 
     public byte[] meta() {
         return meta;
+    }
+
+    @Nullable
+    public IndexFileKind fileKind() {
+        return fileKind;
+    }
+
+    @Nullable
+    public Range rowRange() {
+        return rowRange;
     }
 }

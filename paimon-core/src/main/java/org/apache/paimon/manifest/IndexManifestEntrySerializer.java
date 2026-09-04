@@ -22,6 +22,7 @@ import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.data.GenericArray;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.globalindex.IndexFileKind;
 import org.apache.paimon.index.GlobalIndexMeta;
 import org.apache.paimon.index.IndexFileMeta;
 import org.apache.paimon.utils.ObjectSerializer;
@@ -76,7 +77,8 @@ public class IndexManifestEntrySerializer extends ObjectSerializer<IndexManifest
                 indexFile.rowCount(),
                 dvMetasToRowArrayData(indexFile.dvRanges()),
                 fromString(indexFile.externalPath()),
-                globalIndexRow);
+                globalIndexRow,
+                indexFile.fileKind() == null ? null : fromString(indexFile.fileKind().name()));
     }
 
     @Override
@@ -111,7 +113,10 @@ public class IndexManifestEntrySerializer extends ObjectSerializer<IndexManifest
                             indexMeta,
                             sourceMeta);
         }
-
+        IndexFileKind indexFileKind =
+                row.getFieldCount() > 10 && !row.isNullAt(10)
+                        ? IndexFileKind.valueOf(row.getString(10).toString())
+                        : null;
         return new IndexManifestEntry(
                 FileKind.fromByteValue(row.getByte(0)),
                 deserializeBinaryRow(row.getBinary(1)),
@@ -123,7 +128,8 @@ public class IndexManifestEntrySerializer extends ObjectSerializer<IndexManifest
                         row.getLong(6),
                         row.isNullAt(7) ? null : rowArrayDataToDvMetas(row.getArray(7)),
                         row.isNullAt(8) ? null : row.getString(8).toString(),
-                        globalIndexMeta));
+                        globalIndexMeta,
+                        indexFileKind));
     }
 
     public static Function<InternalRow, BinaryRow> partitionGetter() {
