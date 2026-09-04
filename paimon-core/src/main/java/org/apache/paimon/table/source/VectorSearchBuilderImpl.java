@@ -140,7 +140,14 @@ public class VectorSearchBuilderImpl implements VectorSearchBuilder {
                     pinnedSnapshot);
         }
         return new DataEvolutionVectorScan(
-                table, partitionFilter, filter, vectorColumn, options, pinnedSnapshot);
+                table,
+                partitionFilter,
+                filter,
+                vectorColumn,
+                options,
+                pinnedSnapshot,
+                vector == null ? null : new float[][] {vector},
+                limit);
     }
 
     @Override
