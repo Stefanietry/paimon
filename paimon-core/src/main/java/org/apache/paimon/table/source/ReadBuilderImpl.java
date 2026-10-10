@@ -19,6 +19,7 @@
 package org.apache.paimon.table.source;
 
 import org.apache.paimon.CoreOptions;
+import org.apache.paimon.Snapshot;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.disk.IOManager;
 import org.apache.paimon.metrics.MetricRegistry;
@@ -76,6 +77,8 @@ public class ReadBuilderImpl implements ReadBuilder {
 
     private boolean dropStats = false;
 
+    private @Nullable Snapshot pinnedSnapshot;
+
     public ReadBuilderImpl(InnerTable table) {
         this.table = table;
         this.partitionType = table.rowType().project(table.partitionKeys());
@@ -125,6 +128,12 @@ public class ReadBuilderImpl implements ReadBuilder {
     @Override
     public ReadBuilder withReadType(RowType readType) {
         this.readType = readType;
+        return this;
+    }
+
+    @Override
+    public ReadBuilder withSnapshot(Snapshot snapshot) {
+        this.pinnedSnapshot = snapshot;
         return this;
     }
 
@@ -223,6 +232,10 @@ public class ReadBuilderImpl implements ReadBuilder {
                 .withReadType(readType)
                 .withPartitionFilter(partitionFilter)
                 .withRowRangeIndex(rowRangeIndex);
+
+        if (pinnedSnapshot != null) {
+            scan.withSnapshot(pinnedSnapshot);
+        }
 
         checkState(
                 bucketFilter == null || shardIndexOfThisSubtask == null,

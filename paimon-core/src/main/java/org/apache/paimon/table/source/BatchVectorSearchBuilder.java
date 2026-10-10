@@ -18,13 +18,18 @@
 
 package org.apache.paimon.table.source;
 
+import org.apache.paimon.Snapshot;
+import org.apache.paimon.fs.Path;
 import org.apache.paimon.globalindex.GlobalIndexResult;
 import org.apache.paimon.partition.PartitionPredicate;
 import org.apache.paimon.predicate.Predicate;
 
+import javax.annotation.Nullable;
+
 import java.io.Serializable;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /** Builder to build batch vector search over multiple query vectors. */
 public interface BatchVectorSearchBuilder extends Serializable {
@@ -43,6 +48,36 @@ public interface BatchVectorSearchBuilder extends Serializable {
 
     /** The query vectors; result {@code i} corresponds to {@code vectors[i]}. */
     BatchVectorSearchBuilder withVectors(float[][] vectors);
+
+    /** Pin subsequent vector scan planning and centroid routing to a snapshot. */
+    default BatchVectorSearchBuilder withSnapshot(Snapshot snapshot) {
+        return this;
+    }
+
+    /** Restrict vector search to the given routed IVF centroids. */
+    default BatchVectorSearchBuilder withRoutedCentroids(Set<Integer> centroidIds) {
+        throw new UnsupportedOperationException(
+                getClass().getName() + " does not support routed IVF centroids.");
+    }
+
+    /**
+     * Route each query vector to IVF centroid ids, or return {@code null} if routing is
+     * unsupported.
+     */
+    @Nullable
+    default List<Set<Integer>> routeCentroids() {
+        return routeCentroids(null);
+    }
+
+    /**
+     * Route each query vector to IVF centroid ids with a caller-scoped routing model cache, or
+     * return {@code null} if routing is unsupported.
+     */
+    @Nullable
+    default List<Set<Integer>> routeCentroids(Map<Path, AutoCloseable> routingModelCache) {
+        throw new UnsupportedOperationException(
+                getClass().getName() + " does not support routing IVF centroids.");
+    }
 
     /** Option for vector indexes. */
     default BatchVectorSearchBuilder withOption(String key, String value) {

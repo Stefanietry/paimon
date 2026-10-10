@@ -2975,6 +2975,12 @@ public class CoreOptions implements Serializable {
                     .defaultValue(100000L)
                     .withDescription("Row count per shard for global index.");
 
+    public static final ConfigOption<Long> GLOBAL_INDEX_TRAIN_SAMPLE_ROWS =
+            key("global-index.train-sample-rows")
+                    .longType()
+                    .defaultValue(100000L)
+                    .withDescription("Training sample row count for global index.");
+
     public static final ConfigOption<Integer> GLOBAL_INDEX_BUILD_MAX_SHARD =
             key("global-index.build.max-shard")
                     .intType()
@@ -3117,6 +3123,14 @@ public class CoreOptions implements Serializable {
                     .booleanType()
                     .defaultValue(false)
                     .withDescription("Whether to process distributed vector search.");
+
+    public static final ConfigOption<Boolean> VECTOR_SEARCH_LATERAL_PARTITION_BASED_ENABLED =
+            key("vector-search.lateral.partition-based.enabled")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Whether to enable the partition-based execution mode for lateral vector "
+                                    + "search.");
 
     public static final ConfigOption<Integer> VECTOR_SEARCH_LATERAL_JOIN_BATCH_SIZE =
             key("vector-search.lateral-join.batch-size")
@@ -4827,6 +4841,10 @@ public class CoreOptions implements Serializable {
         return options.get(GLOBAL_INDEX_ROW_COUNT_PER_SHARD);
     }
 
+    public long globalIndexTrainSampleRows() {
+        return options.get(GLOBAL_INDEX_TRAIN_SAMPLE_ROWS);
+    }
+
     public boolean globalIndexEnabled() {
         return options.get(GLOBAL_INDEX_ENABLED);
     }
@@ -4913,6 +4931,10 @@ public class CoreOptions implements Serializable {
 
     public boolean vectorSearchDistributeEnabled() {
         return options.get(VECTOR_SEARCH_DISTRIBUTE_ENABLED);
+    }
+
+    public boolean vectorSearchLateralPartitionBasedEnabled() {
+        return options.get(VECTOR_SEARCH_LATERAL_PARTITION_BASED_ENABLED);
     }
 
     public int vectorSearchLateralJoinBatchSize() {

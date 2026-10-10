@@ -19,6 +19,7 @@
 package org.apache.paimon.table.source;
 
 import org.apache.paimon.CoreOptions;
+import org.apache.paimon.Snapshot;
 import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.GenericArray;
@@ -27,13 +28,21 @@ import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.data.serializer.InternalRowSerializer;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.globalindex.GlobalIndexBuilderUtils;
+import org.apache.paimon.globalindex.GlobalIndexIOMeta;
 import org.apache.paimon.globalindex.GlobalIndexMultiColumnWriter;
+import org.apache.paimon.globalindex.GlobalIndexReader;
 import org.apache.paimon.globalindex.GlobalIndexResult;
 import org.apache.paimon.globalindex.GlobalIndexSingleColumnWriter;
+import org.apache.paimon.globalindex.GlobalIndexWriter;
+import org.apache.paimon.globalindex.IndexFileKind;
 import org.apache.paimon.globalindex.ResultEntry;
+import org.apache.paimon.globalindex.RoutedVectorGlobalIndexer;
 import org.apache.paimon.globalindex.ScoredGlobalIndexResult;
 import org.apache.paimon.globalindex.bitmap.MultiValueGlobalIndexerFactory;
 import org.apache.paimon.globalindex.btree.BTreeGlobalIndexerFactory;
+import org.apache.paimon.globalindex.io.GlobalIndexFileReader;
+import org.apache.paimon.globalindex.io.GlobalIndexFileWriter;
+import org.apache.paimon.index.GlobalIndexMeta;
 import org.apache.paimon.globalindex.testvector.TestVectorGlobalIndexer;
 import org.apache.paimon.globalindex.testvector.TestVectorGlobalIndexerFactory;
 import org.apache.paimon.index.IndexFileMeta;
@@ -66,6 +75,8 @@ import org.apache.paimon.types.DataTypes;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.Range;
 import org.apache.paimon.utils.RoaringNavigableMap64;
+import org.apache.paimon.manifest.FileKind;
+import org.apache.paimon.manifest.IndexManifestEntry;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -79,8 +90,11 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
 
 import static org.apache.paimon.table.source.DeletionVectorTestUtils.commitDeletionVectors;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -196,6 +210,103 @@ public class VectorSearchBuilderTest extends TableTestBase {
         assertThat(ids.size()).isLessThanOrEqualTo(3);
         // Row 0 (1.0, 0.0) should be the closest to query (0.85, 0.15)
         assertThat(ids).contains(0);
+    }
+
+    @Test
+    public void testReadBuilderWithSnapshotPinsBatchScan() throws Exception {
+        createTableDefault();
+        FileStoreTable table = getTableDefault();
+
+        writeVectors(table, new float[][] {{1.0f, 0.0f}});
+        Snapshot snapshot = table.latestSnapshot().get();
+        writeVectors(table, new float[][] {{2.0f, 0.0f}, {3.0f, 0.0f}});
+
+        ReadBuilder readBuilder = table.newReadBuilder().withSnapshot(snapshot);
+
+        assertThat(readBuilder.newScan().plan().splits())
+                .allSatisfy(
+                        split ->
+                                assertThat(((DataSplit) split).snapshotId())
+                                        .isEqualTo(snapshot.id()));
+    }
+
+    @Test
+    public void testBatchVectorSearchBuilderWithSnapshotPinsBuilder() throws Exception {
+        createTableDefault();
+        FileStoreTable table = getTableDefault();
+        writeVectors(table, new float[][] {{1.0f, 0.0f}});
+        Snapshot snapshot = table.latestSnapshot().get();
+
+        BatchVectorSearchBuilderImpl builder =
+                (BatchVectorSearchBuilderImpl) table.newBatchVectorSearchBuilder();
+        builder.withSnapshot(snapshot);
+
+        assertThat(builder.pinnedSnapshot).isSameAs(snapshot);
+    }
+
+    @Test
+    public void testIvfRouterUsesExplicitCentroidsToPruneShardFiles() throws Exception {
+        createTableDefault();
+        FileStoreTable table = getTableDefault();
+        DataField vectorField = table.rowType().getField(VECTOR_FIELD_NAME);
+        RoutedVectorGlobalIndexer indexer = routedIndexerBySingleByteCentroid();
+        Set<Integer> routedCentroids = new HashSet<>();
+        routedCentroids.add(2);
+        IvfIndexFileRouter router =
+                new IvfIndexFileRouter(
+                        table,
+                        null,
+                        vectorField,
+                        Collections.emptyMap(),
+                        null,
+                        0,
+                        "ivf-pq",
+                        indexer,
+                        routedCentroids);
+
+        List<IndexManifestEntry> entries =
+                Arrays.asList(
+                        indexEntry(
+                                "ivf-pq",
+                                "routing-model",
+                                vectorField.id(),
+                                new byte[] {9},
+                                IndexFileKind.ROUTING_MODEL),
+                        indexEntry("ivf-pq", "centroid-1", vectorField.id(), new byte[] {1}, null),
+                        indexEntry("ivf-pq", "centroid-2", vectorField.id(), new byte[] {2}, null),
+                        indexEntry(
+                                BTreeGlobalIndexerFactory.IDENTIFIER,
+                                "scalar-index",
+                                0,
+                                new byte[] {2},
+                                null));
+
+        assertThat(router.searchableIndexFileEntries(entries))
+                .extracting(entry -> entry.indexFile().fileName())
+                .containsExactly("centroid-1", "centroid-2", "scalar-index");
+        assertThat(router.routingIndexFileEntries(entries))
+                .extracting(entry -> entry.indexFile().fileName())
+                .containsExactly("routing-model");
+
+        List<IndexFileMeta> routedFiles =
+                router.tryRouteIndexFiles(
+                        router.searchableIndexFileEntries(entries),
+                        router.routingIndexFileEntries(entries));
+
+        assertThat(routedFiles).isNotNull();
+        assertThat(routedFiles).extracting(IndexFileMeta::fileName).containsExactly("centroid-2");
+    }
+
+    @Test
+    public void testIvfRouterDoesNotRouteWhenFilterIsPresent() {
+        assertThat(
+                        IvfIndexFileRouter.canAttemptRouting(
+                                new PredicateBuilder(RowType.of(new DataField(0, "id", DataTypes.INT())))
+                                        .greaterOrEqual(0, 1),
+                                new float[][] {{1.0f, 0.0f}},
+                                1,
+                                "ivf-pq"))
+                .isFalse();
     }
 
     @Test
@@ -2023,6 +2134,71 @@ public class VectorSearchBuilderTest extends TableTestBase {
             }
             commit.commit(write.prepareCommit());
         }
+    }
+
+    private RoutedVectorGlobalIndexer routedIndexerBySingleByteCentroid() {
+        return new RoutedVectorGlobalIndexer() {
+            @Override
+            public GlobalIndexWriter createWriter(GlobalIndexFileWriter fileWriter) {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override
+            public GlobalIndexReader createReader(
+                    GlobalIndexFileReader fileReader,
+                    List<GlobalIndexIOMeta> files,
+                    long totalRowCount,
+                    List<Range> rowRanges,
+                    ExecutorService executor) {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override
+            public String metric() {
+                return "l2";
+            }
+
+            @Override
+            public boolean isRoutingGlobalIndexFile(IndexFileKind fileKind, byte[] indexMeta) {
+                return fileKind == IndexFileKind.ROUTING_MODEL;
+            }
+
+            @Override
+            public Set<Integer> routeCentroids(
+                    GlobalIndexFileReader fileReader,
+                    GlobalIndexIOMeta globalIndexFile,
+                    float[][] queryVectors,
+                    int limit,
+                    Map<String, String> options) {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override
+            public boolean acceptsRoutedIndexFile(byte[] indexMeta, Set<Integer> routedCentroids) {
+                return indexMeta.length == 1 && routedCentroids.contains((int) indexMeta[0]);
+            }
+        };
+    }
+
+    private IndexManifestEntry indexEntry(
+            String indexType,
+            String fileName,
+            int indexFieldId,
+            byte[] indexMeta,
+            IndexFileKind fileKind) {
+        return new IndexManifestEntry(
+                FileKind.ADD,
+                BinaryRow.EMPTY_ROW,
+                0,
+                new IndexFileMeta(
+                        indexType,
+                        fileName,
+                        1,
+                        1,
+                        null,
+                        null,
+                        new GlobalIndexMeta(0, 0, indexFieldId, null, indexMeta),
+                        fileKind));
     }
 
     @Test

@@ -18,6 +18,7 @@
 
 package org.apache.paimon.table.source;
 
+import org.apache.paimon.Snapshot;
 import org.apache.paimon.annotation.Public;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.partition.PartitionPredicate;
@@ -105,6 +106,11 @@ public interface ReadBuilder extends Serializable {
 
     /** Push partition filters. */
     ReadBuilder withPartitionFilter(PartitionPredicate partitionPredicate);
+
+    /** Pin subsequent batch scan planning to a snapshot. */
+    default ReadBuilder withSnapshot(Snapshot snapshot) {
+        return this;
+    }
 
     ReadBuilder withBucket(int bucket);
 

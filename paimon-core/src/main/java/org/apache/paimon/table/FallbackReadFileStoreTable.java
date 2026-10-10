@@ -424,6 +424,7 @@ public class FallbackReadFileStoreTable extends DelegatedFileStoreTable {
         protected final DataTableScan fallbackScan;
         private PartitionPredicate mainPartitionPredicate;
         private PartitionPredicate fallbackPartitionPredicate;
+        @Nullable private Snapshot pinnedSnapshot;
 
         public FallbackReadScan(
                 FileStoreTable wrappedTable,
@@ -464,6 +465,14 @@ public class FallbackReadFileStoreTable extends DelegatedFileStoreTable {
         public FallbackReadScan withReadType(@Nullable RowType readType) {
             mainScan.withReadType(readType);
             fallbackScan.withReadType(readType);
+            return this;
+        }
+
+        @Override
+        public FallbackReadScan withSnapshot(Snapshot snapshot) {
+            this.pinnedSnapshot = snapshot;
+            mainScan.withSnapshot(snapshot);
+            fallbackScan.withSnapshot(snapshot);
             return this;
         }
 
@@ -658,6 +667,9 @@ public class FallbackReadFileStoreTable extends DelegatedFileStoreTable {
 
         private DataTableScan newPartitionListingScan(boolean isMain) {
             DataTableScan scan = scanCreator.apply(isMain ? wrappedTable : fallbackTable);
+            if (pinnedSnapshot != null) {
+                scan.withSnapshot(pinnedSnapshot);
+            }
             if (isMain && getMainPartitionPredicate() != null) {
                 scan.withPartitionFilter(getMainPartitionPredicate());
             } else if (!isMain && getFallbackPartitionPredicate() != null) {

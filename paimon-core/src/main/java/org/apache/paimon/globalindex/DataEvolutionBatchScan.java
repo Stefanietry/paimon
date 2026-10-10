@@ -167,6 +167,12 @@ public class DataEvolutionBatchScan implements DataTableScan {
     }
 
     @Override
+    public InnerTableScan withSnapshot(Snapshot snapshot) {
+        batchScan.withSnapshot(snapshot);
+        return this;
+    }
+
+    @Override
     public InnerTableScan withBucket(int bucket) {
         batchScan.withBucket(bucket);
         return this;

@@ -117,6 +117,7 @@ abstract class AbstractDataTableScan implements DataTableScan {
     private Set<String> partitionFilterFields = Collections.emptySet();
     // re-applied after the deferred filter push, which writes the same slot
     @Nullable private Runnable reapplyPartitionFilter;
+    @Nullable private Snapshot pinnedSnapshot;
 
     protected AbstractDataTableScan(
             TableSchema schema,
@@ -278,6 +279,13 @@ abstract class AbstractDataTableScan implements DataTableScan {
                         ? Collections.emptySet()
                         : PredicateVisitor.collectFieldNames(predicate),
                 () -> snapshotReader.withPartitionFilter(predicate));
+    }
+
+    @Override
+    public AbstractDataTableScan withSnapshot(Snapshot snapshot) {
+        this.pinnedSnapshot = snapshot;
+        snapshotReader.withSnapshot(snapshot);
+        return this;
     }
 
     @Override
@@ -455,6 +463,10 @@ abstract class AbstractDataTableScan implements DataTableScan {
 
     protected StartingScanner createStartingScanner(boolean isStreaming) {
         SnapshotManager snapshotManager = snapshotReader.snapshotManager();
+        if (pinnedSnapshot != null) {
+            checkArgument(!isStreaming, "Pinned snapshot is not supported for streaming scan.");
+            return new StaticFromSnapshotStartingScanner(snapshotManager, pinnedSnapshot.id());
+        }
         ChangelogManager changelogManager = snapshotReader.changelogManager();
         CoreOptions.StreamScanMode type =
                 options.toConfiguration().get(CoreOptions.STREAM_SCAN_MODE);

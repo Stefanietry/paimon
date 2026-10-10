@@ -18,7 +18,9 @@
 
 package org.apache.paimon.table.source;
 
+import org.apache.paimon.Snapshot;
 import org.apache.paimon.catalog.TableQueryAuthResult;
+import org.apache.paimon.fs.Path;
 import org.apache.paimon.partition.PartitionPredicate;
 import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.predicate.PredicateBuilder;
@@ -27,11 +29,16 @@ import org.apache.paimon.table.InnerTable;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.utils.Pair;
 
+import javax.annotation.Nullable;
+
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 import static org.apache.paimon.partition.PartitionPredicate.splitPartitionPredicatesAndDataPredicates;
 import static org.apache.paimon.utils.Preconditions.checkArgument;
@@ -50,6 +57,8 @@ public class BatchVectorSearchBuilderImpl implements BatchVectorSearchBuilder {
     protected DataField vectorColumn;
     protected float[][] vectors;
     protected Map<String, String> options = new HashMap<>();
+    protected Set<Integer> routedCentroids;
+    @Nullable protected Snapshot pinnedSnapshot;
 
     public BatchVectorSearchBuilderImpl(InnerTable table) {
         this.table = (FileStoreTable) table;
@@ -111,6 +120,48 @@ public class BatchVectorSearchBuilderImpl implements BatchVectorSearchBuilder {
     }
 
     @Override
+    public BatchVectorSearchBuilder withRoutedCentroids(Set<Integer> centroidIds) {
+        this.routedCentroids =
+                centroidIds == null
+                        ? null
+                        : Collections.unmodifiableSet(new HashSet<>(centroidIds));
+        return this;
+    }
+
+    @Override
+    public BatchVectorSearchBuilder withSnapshot(Snapshot snapshot) {
+        this.pinnedSnapshot = snapshot;
+        return this;
+    }
+
+    @Override
+    public List<Set<Integer>> routeCentroids() {
+        return routeCentroids(null);
+    }
+
+    @Override
+    public List<Set<Integer>> routeCentroids(Map<Path, AutoCloseable> routingModelCache) {
+        checkArgument(
+                !isPrimaryKeyVectorSearch(),
+                "Primary-key vector search does not support IVF centroid routing.");
+        checkNotNull(vectorColumn, "Vector column must be set via withVectorColumn()");
+        checkArgument(
+                vectors != null && vectors.length > 0, "vectors must be set via withVectors()");
+        return new DataEvolutionVectorScan(
+                        table,
+                        partitionFilter,
+                        filter,
+                        vectorColumn,
+                        options,
+                        pinnedSnapshot,
+                        vectors,
+                        limit,
+                        null,
+                        routingModelCache)
+                .routeCentroids();
+    }
+
+    @Override
     public BatchVectorSearchBuilder withOptions(Map<String, String> options) {
         if (options != null) {
             this.options.putAll(options);
@@ -135,7 +186,16 @@ public class BatchVectorSearchBuilderImpl implements BatchVectorSearchBuilder {
                     partitionFilter,
                     filter);
         }
-        return new DataEvolutionVectorScan(table, partitionFilter, filter, vectorColumn, options);
+        return new DataEvolutionVectorScan(
+                table,
+                partitionFilter,
+                filter,
+                vectorColumn,
+                options,
+                pinnedSnapshot,
+                vectors,
+                limit,
+                routedCentroids);
     }
 
     @Override
