@@ -18,11 +18,12 @@
 
 package org.apache.paimon.spark.sql
 
+import org.apache.paimon.CoreOptions
 import org.apache.paimon.data.{BinaryString, GenericRow, Timestamp}
 import org.apache.paimon.manifest.ManifestCommittable
 import org.apache.paimon.spark.PaimonHiveTestBase
-import org.apache.paimon.spark.catalyst.plans.logical.{LateralVectorSearch, PaimonTableValuedFunctions}
-import org.apache.paimon.spark.execution.LateralVectorSearchExec
+import org.apache.paimon.spark.catalyst.plans.logical.{LateralVectorSearch, PaimonTableValuedFunctions, PartitionBasedLateralVectorSearch}
+import org.apache.paimon.spark.execution.{LateralVectorSearchExec, PartitionBasedLateralVectorSearchExec}
 import org.apache.paimon.utils.DateTimeUtils
 
 import org.apache.spark.sql.{DataFrame, Row}
@@ -112,6 +113,112 @@ class TableValuedFunctionsTest extends PaimonHiveTestBase with AdaptiveSparkPlan
       }
     } finally {
       spark.conf.unset(parallelismKey)
+    }
+  }
+
+  test("lateral vector search partition-based rule is disabled by default") {
+    withTable("vector_search_source") {
+      createVectorSearchSource()
+
+      val optimizedPlan = spark
+        .sql("""
+               |SELECT q.gid AS query_gid, r.gid AS result_gid
+               |FROM (
+               |  SELECT gid, embs
+               |  FROM vector_search_source
+               |  LIMIT 1000
+               |) AS q,
+               |LATERAL (
+               |  SELECT gid
+               |  FROM vector_search('vector_search_source', 'embs', q.embs, 3)
+               |) AS r
+               |""".stripMargin)
+        .queryExecution
+        .optimizedPlan
+
+      assert(optimizedPlan.collect { case _: LateralVectorSearch => () }.size == 1)
+      assert(optimizedPlan.collect { case _: PartitionBasedLateralVectorSearch => () }.isEmpty)
+    }
+  }
+
+  test("lateral vector search partition-based rule rewrites plan when enabled") {
+    val enabledKey =
+      s"spark.paimon.${CoreOptions.VECTOR_SEARCH_LATERAL_PARTITION_BASED_ENABLED.key()}"
+    spark.conf.set(enabledKey, "true")
+    try {
+      withTable("vector_search_source") {
+        createVectorSearchSource()
+
+        val query = spark.sql("""
+                                |SELECT q.gid AS query_gid, r.gid AS result_gid
+                                |FROM (
+                                |  SELECT gid, embs
+                                |  FROM vector_search_source
+                                |  LIMIT 1000
+                                |) AS q,
+                                |LATERAL (
+                                |  SELECT gid
+                                |  FROM vector_search('vector_search_source', 'embs', q.embs, 3)
+                                |  WHERE dt = '20260629'
+                                |) AS r
+                                |""".stripMargin)
+        val optimizedPlan = query.queryExecution.optimizedPlan
+
+        assert(optimizedPlan.collect { case _: LateralVectorSearch => () }.isEmpty)
+        val partitionBasedSearches = optimizedPlan.collect {
+          case pblvs: PartitionBasedLateralVectorSearch => pblvs
+        }
+        assert(partitionBasedSearches.size == 1, optimizedPlan.toString)
+        assert(partitionBasedSearches.head.searchFilters.nonEmpty, optimizedPlan.toString)
+
+        val executedPlan = query.queryExecution.executedPlan
+        assert(
+          collect(executedPlan) {
+            case exec: PartitionBasedLateralVectorSearchExec => exec
+          }.size == 1,
+          executedPlan.toString)
+      }
+    } finally {
+      spark.conf.unset(enabledKey)
+    }
+  }
+
+  test("lateral vector search partition-based rule skips non-deterministic query vector") {
+    val enabledKey =
+      s"spark.paimon.${CoreOptions.VECTOR_SEARCH_LATERAL_PARTITION_BASED_ENABLED.key()}"
+    spark.conf.set(enabledKey, "true")
+    try {
+      withTable("vector_search_source") {
+        createVectorSearchSource()
+
+        val optimizedPlan = spark
+          .sql("""
+                 |SELECT q.gid AS query_gid, r.gid AS result_gid
+                 |FROM (
+                 |  SELECT gid, embs
+                 |  FROM vector_search_source
+                 |  LIMIT 1000
+                 |) AS q,
+                 |LATERAL (
+                 |  SELECT gid
+                 |  FROM vector_search(
+                 |    'vector_search_source',
+                 |    'embs',
+                 |    array(
+                 |      cast(q.gid + rand() as float),
+                 |      cast(q.gid + rand() as float),
+                 |      cast(q.gid + rand() as float)),
+                 |    3)
+                 |) AS r
+                 |""".stripMargin)
+          .queryExecution
+          .optimizedPlan
+
+        assert(optimizedPlan.collect { case _: LateralVectorSearch => () }.size == 1)
+        assert(optimizedPlan.collect { case _: PartitionBasedLateralVectorSearch => () }.isEmpty)
+      }
+    } finally {
+      spark.conf.unset(enabledKey)
     }
   }
 

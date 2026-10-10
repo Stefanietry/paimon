@@ -18,6 +18,7 @@
 
 package org.apache.paimon.spark.catalyst.plans.logical
 
+import org.apache.paimon.spark.execution.LateralVectorSearchExec
 import org.apache.paimon.table.InnerTable
 import org.apache.paimon.types.{ArrayType, DataType, DataTypes, RowType}
 
@@ -28,6 +29,16 @@ import java.lang.reflect.{InvocationHandler, Method, Proxy}
 
 /** Tests for [[VectorSearchQuery]]. */
 class VectorSearchQueryTest extends AnyFunSuite {
+
+  test("partition-based lateral vector search preserves empty options by default") {
+    assert(!LateralVectorSearchExec.partitionBasedRoutingOptions(Map.empty).contains("ivf.nprobe"))
+  }
+
+  test("partition-based lateral vector search preserves explicit nprobe") {
+    assert(
+      LateralVectorSearchExec.partitionBasedRoutingOptions(Map("ivf.nprobe" -> "8"))(
+        "ivf.nprobe") == "8")
+  }
 
   test("create hybrid search with vector route configs") {
     val search = HybridSearchQuery(Seq.empty).createHybridSearch(

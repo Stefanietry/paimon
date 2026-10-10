@@ -18,8 +18,9 @@
 
 package org.apache.paimon.spark.execution
 
-import org.apache.paimon.CoreOptions
+import org.apache.paimon.{CoreOptions, Snapshot}
 import org.apache.paimon.data.BinaryRow
+import org.apache.paimon.fs.Path
 import org.apache.paimon.globalindex.{GlobalIndexResult, IndexedSplit, ScoredGlobalIndexResult}
 import org.apache.paimon.partition.PartitionPredicate
 import org.apache.paimon.partition.PartitionPredicate.splitPartitionPredicatesAndDataPredicates
@@ -29,17 +30,19 @@ import org.apache.paimon.spark.catalog.{SparkBaseCatalog, SupportView}
 import org.apache.paimon.spark.catalyst.analysis.ResolvedPaimonView
 import org.apache.paimon.spark.catalyst.optimizer.PushDownMapSelectedKeys
 import org.apache.paimon.spark.catalyst.optimizer.RepartitionLateralVectorSearchInput
-import org.apache.paimon.spark.catalyst.plans.logical.{CopyIntoLocationCommand, CopyIntoLocationSource, CopyIntoTableCommand, CreateOrReplaceTagCommand, CreatePaimonView, DeleteTagCommand, DropPaimonView, LateralVectorSearch, PaimonCallCommand, PaimonDropPartitions, PaimonTableValuedFunctions, RenameTagCommand, ResolvedIdentifier, ShowPaimonViews, ShowTagsCommand, TruncatePaimonTableWithFilter}
+import org.apache.paimon.spark.catalyst.plans.logical.{CopyIntoLocationCommand, CopyIntoLocationSource, CopyIntoTableCommand, CreateOrReplaceTagCommand, CreatePaimonView, DeleteTagCommand, DropPaimonView, LateralVectorSearch, PaimonCallCommand, PaimonDropPartitions, PaimonTableValuedFunctions, PartitionBasedLateralVectorSearch, RenameTagCommand, ResolvedIdentifier, ShowPaimonViews, ShowTagsCommand, TruncatePaimonTableWithFilter}
 import org.apache.paimon.spark.data.SparkInternalRow
 import org.apache.paimon.spark.format.PaimonFormatTable
 import org.apache.paimon.spark.read.VectorSearchResultUtils
 import org.apache.paimon.spark.schema.PaimonMetadataColumn
-import org.apache.paimon.table.{InnerTable, SpecialFields, Table}
+import org.apache.paimon.table.{FileStoreTable, InnerTable, SpecialFields, Table}
 import org.apache.paimon.table.source.{BatchVectorSearchBuilder, DataSplit, InnerTableScan, PrimaryKeyScoredResult, PrimaryKeySearchPosition, PrimaryKeyVectorResult, ReadBuilder, VectorScan}
+import org.apache.paimon.table.source.snapshot.TimeTravelUtil
 import org.apache.paimon.types.RowType
-import org.apache.paimon.utils.RoaringNavigableMap64
+import org.apache.paimon.utils.{IOUtils, RoaringNavigableMap64}
 
-import org.apache.spark.TaskContext
+import org.apache.spark.{HashPartitioner, TaskContext}
+import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
@@ -140,6 +143,20 @@ case class PaimonStrategy(spark: SparkSession)
         lvs.projectOutput,
         lvs.searchFilters,
         planLater(lvs.left)
+      ) :: Nil
+
+    case pblvs: PartitionBasedLateralVectorSearch =>
+      new PartitionBasedLateralVectorSearchExec(
+        pblvs.innerTable,
+        pblvs.columnName,
+        pblvs.queryVectorExpr,
+        pblvs.limit,
+        pblvs.options,
+        pblvs.vectorSearchOutput,
+        pblvs.projectList,
+        pblvs.projectOutput,
+        pblvs.searchFilters,
+        planLater(pblvs.left)
       ) :: Nil
 
     case t @ ShowTagsCommand(PaimonCatalogAndIdentifier(catalog, ident)) =>
@@ -348,6 +365,26 @@ private case class EmptyPostponeMergeExec(output: Seq[Attribute]) extends LeafEx
   override protected def doExecute(): RDD[InternalRow] = sparkContext.emptyRDD[InternalRow]
 }
 
+object LateralVectorSearchExec {
+
+  private[spark] def partitionBasedRoutingOptions(
+      options: Map[String, String]): Map[String, String] = {
+    options
+  }
+
+  private case class PartitionBasedRoutedQuery(
+      queryId: Long,
+      outerRow: InternalRow,
+      // Null for deterministic query expressions; recomputed from outerRow after centroid shuffle.
+      queryVector: Array[Float])
+
+  private case class PartitionBasedMatch(
+      queryId: Long,
+      outerRow: InternalRow,
+      rowId: Long,
+      score: Float)
+}
+
 case class LateralVectorSearchExec(
     innerTable: InnerTable,
     columnName: String,
@@ -358,9 +395,13 @@ case class LateralVectorSearchExec(
     projectList: Seq[Expression],
     projectOutput: Seq[Attribute],
     searchFilters: Seq[Expression],
-    child: SparkPlan)
+    child: SparkPlan,
+    planVectorSearchPerBatch: Boolean = false)
   extends SparkPlan
-  with PredicateHelper {
+  with PredicateHelper
+  with Logging {
+
+  import LateralVectorSearchExec.{PartitionBasedMatch, PartitionBasedRoutedQuery}
 
   override def children: Seq[SparkPlan] = Seq(child)
 
@@ -404,6 +445,10 @@ case class LateralVectorSearchExec(
   }
 
   override protected def doExecute(): RDD[InternalRow] = {
+    if (planVectorSearchPerBatch) {
+      return doExecutePartitionBased()
+    }
+
     child.execute().mapPartitions {
       outerRows =>
         val queryVectorProjection = UnsafeProjection.create(Seq(queryVectorExpr), child.output)
@@ -439,11 +484,255 @@ case class LateralVectorSearchExec(
     }
   }
 
+  private def doExecutePartitionBased(): RDD[InternalRow] = {
+    val pinnedSnapshot = Option(
+      TimeTravelUtil.tryTravelOrLatest(innerTable.asInstanceOf[FileStoreTable]))
+    val carryQueryVectorInShuffle = !queryVectorExpr.deterministic
+    val resultVectorSearchOutput = partitionBasedResultVectorSearchOutput
+    val queryRows = child.execute().map(_.copy()).zipWithUniqueId().map {
+      case (outerRow, queryId) => queryId -> outerRow
+    }
+
+    val routedQueries = queryRows.mapPartitions {
+      outerRows =>
+        val queryVectorProjection = UnsafeProjection.create(Seq(queryVectorExpr), child.output)
+        val rightProjection =
+          UnsafeProjection.create(projectList, child.output ++ resultVectorSearchOutput)
+        val readerTracker = new LateralVectorSearchReaderTracker
+        val routingModelCache = new java.util.HashMap[Path, AutoCloseable]()
+        Option(TaskContext.get()).foreach(
+          _.addTaskCompletionListener[Unit](
+            _ => {
+              readerTracker.closeCurrent()
+              routingModelCache.values().asScala.foreach(model => IOUtils.closeQuietly(model))
+            }))
+        val searchContext = createSearchContext(
+          rightProjection,
+          readerTracker,
+          pinnedSnapshot,
+          resultVectorSearchOutput)
+
+        outerRows.grouped(searchContext.batchSize).flatMap {
+          outerRowBatch =>
+            val searchBatch = outerRowBatch.flatMap {
+              case (queryId, outerRow) =>
+                toFloatArray(queryVectorProjection(outerRow).get(0, queryVectorExpr.dataType))
+                  .map(
+                    queryVector =>
+                      PartitionBasedRoutedQuery(
+                        queryId,
+                        outerRow,
+                        if (carryQueryVectorInShuffle) queryVector else null) -> queryVector)
+            }
+
+            if (searchBatch.isEmpty) {
+              Iterator.empty
+            } else {
+              val routedCentroids = searchContext.routingVectorSearchBuilder
+                .withVectors(searchBatch.map(_._2).toArray)
+                .routeCentroids(routingModelCache)
+              if (routedCentroids == null) {
+                throw new UnsupportedOperationException(
+                  "Partition-based LATERAL vector_search requires centroid-based IVF indexes.")
+              }
+              require(
+                routedCentroids.size() == searchBatch.size,
+                s"Centroid routing returned ${routedCentroids.size()} results for " +
+                  s"${searchBatch.size} query vectors.")
+              searchBatch.zip(routedCentroids.asScala).flatMap {
+                case ((query, _), centroids) =>
+                  centroids.asScala.map(centroid => centroid.intValue() -> query)
+              }
+            }
+        }
+    }
+
+    val centroidPartitioner = new HashPartitioner(RepartitionLateralVectorSearchInput.parallelism)
+    logInfo(
+      "Partition-based lateral vector search shuffle schema: " +
+        s"stage=route-by-centroid, key=centroid: Int, " +
+        s"value=PartitionBasedRoutedQuery(queryId: Long, outerRow: InternalRow, " +
+        s"queryVector: Array[Float] only for non-deterministic query expression), " +
+        s"partitions=${centroidPartitioner.numPartitions}")
+
+    val partialMatches = routedQueries
+      .partitionBy(centroidPartitioner)
+      .mapPartitions {
+        partitionQueries =>
+          val queryVectorProjection = UnsafeProjection.create(Seq(queryVectorExpr), child.output)
+          val rightProjection =
+            UnsafeProjection.create(projectList, child.output ++ resultVectorSearchOutput)
+          val readerTracker = new LateralVectorSearchReaderTracker
+          Option(TaskContext.get())
+            .foreach(_.addTaskCompletionListener[Unit](_ => readerTracker.closeCurrent()))
+          val searchContext = createSearchContext(
+            rightProjection,
+            readerTracker,
+            pinnedSnapshot,
+            resultVectorSearchOutput)
+          val queryBuffers =
+            scala.collection.mutable.HashMap.empty[Int, ArrayBuffer[PartitionBasedRoutedQuery]]
+
+          def searchRoutedCentroidBatch(
+              centroid: Int,
+              queryBatch: Seq[PartitionBasedRoutedQuery]): Iterator[PartitionBasedMatch] = {
+            val queryVectors = queryBatch.map(routedQueryVector(_, queryVectorProjection)).toArray
+            val javaCentroids = Set(Integer.valueOf(centroid)).asJava
+            val globalIndexResults = searchContext.vectorSearchBuilder
+              .withRoutedCentroids(javaCentroids)
+              .withVectors(queryVectors)
+              .newBatchVectorRead()
+              .readBatch(vectorPlan(searchContext))
+              .asScala
+              .toVector
+            require(
+              globalIndexResults.size == queryBatch.size,
+              s"Local partition-based vector search returned ${globalIndexResults.size} " +
+                s"results for ${queryBatch.size} query vectors."
+            )
+            queryBatch.iterator.zip(globalIndexResults.iterator).flatMap {
+              case (query, result) =>
+                val scoreGetter = result match {
+                  case scored: ScoredGlobalIndexResult => scored.scoreGetter()
+                  case _ =>
+                    throw new UnsupportedOperationException(
+                      "Partition-based LATERAL vector_search requires scored vector search results.")
+                }
+                result.results().iterator().asScala.map {
+                  rowId =>
+                    PartitionBasedMatch(
+                      query.queryId,
+                      query.outerRow,
+                      rowId,
+                      scoreGetter.score(rowId))
+                }
+            }
+          }
+
+          partitionQueries.flatMap {
+            case (centroid, query) =>
+              val buffer =
+                queryBuffers.getOrElseUpdate(centroid, ArrayBuffer[PartitionBasedRoutedQuery]())
+              buffer += query
+              if (buffer.size >= searchContext.batchSize) {
+                queryBuffers.remove(centroid)
+                searchRoutedCentroidBatch(centroid, buffer.toVector)
+              } else {
+                Iterator.empty
+              }
+          } ++ queryBuffers.iterator.flatMap {
+            case (centroid, queryBuffer) =>
+              if (queryBuffer.isEmpty) {
+                Iterator.empty
+              } else {
+                searchRoutedCentroidBatch(centroid, queryBuffer.toVector)
+              }
+          }
+      }
+
+    logInfo(
+      "Partition-based lateral vector search shuffle schema: " +
+        s"stage=topk-by-query-id, key=queryId: Long, " +
+        s"value=PartitionBasedMatch(queryId: Long, outerRow: InternalRow, " +
+        s"rowId: Long, score: Float), " +
+        s"partitions=${partialMatches.partitions.length}")
+    val topKMatches = partialMatches
+      .map(matchResult => matchResult.queryId -> matchResult)
+      .combineByKey[ArrayBuffer[PartitionBasedMatch]](
+        (matchResult: PartitionBasedMatch) => ArrayBuffer[PartitionBasedMatch](matchResult),
+        (matches: ArrayBuffer[PartitionBasedMatch], matchResult: PartitionBasedMatch) =>
+          trimPartitionBasedMatches(matches += matchResult),
+        (left: ArrayBuffer[PartitionBasedMatch], right: ArrayBuffer[PartitionBasedMatch]) =>
+          trimPartitionBasedMatches(left ++= right)
+      )
+      .flatMapValues(matches => sortPartitionBasedMatches(matches).take(limit))
+
+    logInfo(
+      "Partition-based lateral vector search local projection schema: " +
+        s"stage=project-topk, value=(outerRow: InternalRow${attributesSchema(child.output)}, " +
+        s"match: PartitionBasedMatch), partitions=${topKMatches.partitions.length}")
+    val topKMatchesWithOuterRows = topKMatches.map {
+      case (_, matchResult) => matchResult.outerRow -> matchResult
+    }
+
+    topKMatchesWithOuterRows.mapPartitions {
+      matches =>
+        val matchBatch = matches.toVector
+        if (matchBatch.isEmpty) {
+          Iterator.empty
+        } else {
+          val rightProjection =
+            UnsafeProjection.create(projectList, child.output ++ resultVectorSearchOutput)
+          val readerTracker = new LateralVectorSearchReaderTracker
+          Option(TaskContext.get())
+            .foreach(_.addTaskCompletionListener[Unit](_ => readerTracker.closeCurrent()))
+          val searchContext = createSearchContext(
+            rightProjection,
+            readerTracker,
+            pinnedSnapshot,
+            resultVectorSearchOutput)
+          val joinedRow = new JoinedRow
+          if (searchContext.metaColumnsOnly) {
+            projectPartitionBasedMetaOnly(matchBatch, searchContext).map {
+              case (outerRow, rightRow) =>
+                joinedRow(outerRow, rightRow)
+                joinedRow.copy()
+            }
+          } else {
+            fetchPartitionBasedRows(matchBatch, searchContext).map {
+              case (outerRow, rightRow) =>
+                joinedRow(outerRow, rightRow)
+                joinedRow.copy()
+            }
+          }
+        }
+    }
+  }
+
+  private def routedQueryVector(
+      query: PartitionBasedRoutedQuery,
+      queryVectorProjection: UnsafeProjection): Array[Float] = {
+    if (query.queryVector != null) {
+      query.queryVector
+    } else {
+      toFloatArray(queryVectorProjection(query.outerRow).get(0, queryVectorExpr.dataType))
+        .getOrElse(throw new IllegalStateException(
+          s"Cannot recompute query vector for routed query ${query.queryId}."))
+    }
+  }
+
+  private lazy val partitionBasedResultVectorSearchOutput: Seq[Attribute] = {
+    val projectReferences = AttributeSet.fromAttributeSets(projectList.map(_.references))
+    val projectOnlyOutput = vectorSearchOutput.filter(projectReferences.contains)
+    if (
+      VectorSearchResultUtils.isVectorSearchMetaOnly(projectOnlyOutput.map(_.name)) &&
+      searchFiltersOnlyContainPartitionPredicates
+    ) {
+      projectOnlyOutput
+    } else {
+      vectorSearchOutput
+    }
+  }
+
+  private def searchFiltersOnlyContainPartitionPredicates: Boolean = {
+    val predicates = convertSearchFilters()
+    if (predicates.isEmpty) {
+      true
+    } else {
+      splitPartitionPredicatesAndDataPredicates(
+        predicates.asJava,
+        innerTable.rowType(),
+        innerTable.partitionKeys()).getRight.isEmpty
+    }
+  }
+
   private def createSearchContext(
       rightProjection: UnsafeProjection,
-      readerTracker: LateralVectorSearchReaderTracker): LateralVectorSearchContext = {
+      readerTracker: LateralVectorSearchReaderTracker,
+      pinnedSnapshot: Option[Snapshot] = None,
+      resultVectorSearchOutput: Seq[Attribute] = vectorSearchOutput): LateralVectorSearchContext = {
     val rowType = innerTable.rowType()
-    val readFieldNames = vectorSearchOutput
+    val readFieldNames = resultVectorSearchOutput
       .filterNot(
         attr =>
           attr.name == PaimonMetadataColumn.SEARCH_SCORE_COLUMN ||
@@ -460,7 +749,7 @@ case class LateralVectorSearchExec(
       .newReadBuilder()
       .withReadType(readRowType)
     val scoreMetadataColumns =
-      if (vectorSearchOutput.exists(_.name == PaimonMetadataColumn.SEARCH_SCORE_COLUMN)) {
+      if (resultVectorSearchOutput.exists(_.name == PaimonMetadataColumn.SEARCH_SCORE_COLUMN)) {
         Seq(PaimonMetadataColumn.SEARCH_SCORE)
       } else {
         Seq.empty
@@ -479,9 +768,27 @@ case class LateralVectorSearchExec(
       .withVectorColumn(columnName)
       .withLimit(limit)
       .withOptions(options.asJava)
-    pushSearchFilters(Seq(readBuilder, physicalReadBuilder), vectorSearchBuilder)
+    val routingVectorSearchBuilder = innerTable
+      .newBatchVectorSearchBuilder()
+      .withVectorColumn(columnName)
+      .withLimit(limit)
+      .withOptions(LateralVectorSearchExec.partitionBasedRoutingOptions(options).asJava)
+    pinnedSnapshot.foreach {
+      snapshot =>
+        readBuilder.withSnapshot(snapshot)
+        physicalReadBuilder.withSnapshot(snapshot)
+        vectorSearchBuilder.withSnapshot(snapshot)
+        routingVectorSearchBuilder.withSnapshot(snapshot)
+    }
+    pushSearchFilters(
+      Seq(readBuilder, physicalReadBuilder),
+      Seq(vectorSearchBuilder, routingVectorSearchBuilder))
 
-    val vectorPlan = vectorSearchBuilder.newVectorScan().scan()
+    val vectorPlan = if (planVectorSearchPerBatch) {
+      None
+    } else {
+      Some(vectorSearchBuilder.newVectorScan().scan())
+    }
     val batchSize =
       Math.max(1, new CoreOptions(innerTable.options()).vectorSearchLateralJoinBatchSize())
 
@@ -489,13 +796,14 @@ case class LateralVectorSearchExec(
       readBuilder,
       physicalReadBuilder,
       vectorSearchBuilder,
+      routingVectorSearchBuilder,
       vectorPlan,
       scoreMetadataColumns,
       sparkRow,
       rowIdOrdinal = resultRowType.getFieldIndex(SpecialFields.ROW_ID.name()),
       metaColumnsOnly =
-        VectorSearchResultUtils.isVectorSearchMetaOnly(vectorSearchOutput.map(_.name)),
-      projectionInputOrdinals = vectorSearchOutput.map {
+        VectorSearchResultUtils.isVectorSearchMetaOnly(resultVectorSearchOutput.map(_.name)),
+      projectionInputOrdinals = resultVectorSearchOutput.map {
         attr =>
           if (attr.name == PaimonMetadataColumn.SEARCH_SCORE_COLUMN) {
             -1
@@ -504,14 +812,19 @@ case class LateralVectorSearchExec(
           }
       },
       rightProjection,
+      resultVectorSearchOutput,
       batchSize,
       readerTracker
     )
   }
 
+  private def attributesSchema(attributes: Seq[Attribute]): String = {
+    attributes.map(attr => s"${attr.name}: ${attr.dataType.simpleString}").mkString("[", ", ", "]")
+  }
+
   private def pushSearchFilters(
       readBuilders: Seq[ReadBuilder],
-      vectorSearchBuilder: BatchVectorSearchBuilder): Unit = {
+      vectorSearchBuilders: Seq[BatchVectorSearchBuilder]): Unit = {
     val predicates = convertSearchFilters()
     if (predicates.nonEmpty) {
       val split = splitPartitionPredicatesAndDataPredicates(
@@ -521,12 +834,12 @@ case class LateralVectorSearchExec(
       if (split.getLeft.isPresent) {
         val partitionFilter = split.getLeft.get()
         readBuilders.foreach(_.withPartitionFilter(partitionFilter))
-        vectorSearchBuilder.withPartitionFilter(partitionFilter)
+        vectorSearchBuilders.foreach(_.withPartitionFilter(partitionFilter))
       }
       if (!split.getRight.isEmpty) {
         val dataFilter = PredicateBuilder.and(split.getRight)
         readBuilders.foreach(_.withFilter(dataFilter))
-        vectorSearchBuilder.withFilter(dataFilter)
+        vectorSearchBuilders.foreach(_.withFilter(dataFilter))
       }
     }
   }
@@ -556,7 +869,7 @@ case class LateralVectorSearchExec(
     val globalIndexResults = context.vectorSearchBuilder
       .withVectors(vectors)
       .newBatchVectorRead()
-      .readBatch(context.vectorPlan)
+      .readBatch(vectorPlan(context))
       .asScala
       .toVector
     // Batch vector search must return one result per input query vector and preserve the input
@@ -617,7 +930,7 @@ case class LateralVectorSearchExec(
       case (query, result) =>
         result.positions().iterator().asScala.map {
           position =>
-            val values = vectorSearchOutput.map {
+            val values = context.resultVectorSearchOutput.map {
               attr =>
                 attr.name match {
                   case PaimonMetadataColumn.ROW_ID_COLUMN => position.rowPosition()
@@ -741,7 +1054,7 @@ case class LateralVectorSearchExec(
         }
         result.results().iterator().asScala.map {
           rowId =>
-            val values = vectorSearchOutput
+            val values = context.resultVectorSearchOutput
               .map(attr => VectorSearchResultUtils.valueOf(attr.name, rowId, scoreGetter))
               .toArray
             val projectedRow = context.rightProjection(
@@ -757,8 +1070,8 @@ case class LateralVectorSearchExec(
       rightRow: InternalRow,
       searchMatch: LateralVectorSearchMatch,
       context: LateralVectorSearchContext): InternalRow = {
-    val values = new Array[Any](vectorSearchOutput.size)
-    vectorSearchOutput.zipWithIndex.foreach {
+    val values = new Array[Any](context.resultVectorSearchOutput.size)
+    context.resultVectorSearchOutput.zipWithIndex.foreach {
       case (attr, index) =>
         val ordinal = context.projectionInputOrdinals(index)
         values(index) = if (ordinal < 0) {
@@ -768,6 +1081,72 @@ case class LateralVectorSearchExec(
         }
     }
     context.rightProjection(new JoinedRow(searchMatch.outerRow, new GenericInternalRow(values)))
+  }
+
+  private def projectPartitionBasedMetaOnly(
+      matches: Seq[(InternalRow, PartitionBasedMatch)],
+      context: LateralVectorSearchContext): Iterator[(InternalRow, InternalRow)] = {
+    matches.iterator.map {
+      case (outerRow, matchResult) =>
+        val values = context.resultVectorSearchOutput
+          .map(
+            attr =>
+              attr.name match {
+                case PaimonMetadataColumn.ROW_ID_COLUMN => matchResult.rowId
+                case PaimonMetadataColumn.SEARCH_SCORE_COLUMN => matchResult.score
+                case name =>
+                  throw new IllegalArgumentException(
+                    s"Unsupported partition-based vector search metadata column: $name")
+              })
+          .toArray
+        val projectedRow = context.rightProjection(
+          new JoinedRow(outerRow, new GenericInternalRow(values.asInstanceOf[Array[Any]])))
+        (outerRow, projectedRow)
+    }
+  }
+
+  private def fetchPartitionBasedRows(
+      matches: Seq[(InternalRow, PartitionBasedMatch)],
+      context: LateralVectorSearchContext): Iterator[(InternalRow, InternalRow)] = {
+    val rowIdToMatches = matches
+      .groupBy(_._2.rowId)
+      .mapValues(_.map {
+        case (outerRow, matchResult) =>
+          LateralVectorSearchMatch(outerRow, matchResult.score)
+      })
+    val rowIds = new RoaringNavigableMap64()
+    rowIdToMatches.keys.foreach(rowIds.add)
+    val scan = context.readBuilder
+      .newScan()
+      .withGlobalIndexResult(GlobalIndexResult.create(rowIds))
+      .asInstanceOf[InnerTableScan]
+    val read = context.readBuilder.newRead()
+
+    scan.plan().splits().asScala.iterator.flatMap {
+      split =>
+        val reader =
+          PaimonRecordReaderIterator(read.createReader(split), context.scoreMetadataColumns, split)
+        val readerState = context.readerTracker.track(reader)
+        new Iterator[Iterator[(InternalRow, InternalRow)]] {
+          override def hasNext: Boolean = {
+            val hasNext = reader.hasNext
+            if (!hasNext) {
+              readerState.closeOnce()
+            }
+            hasNext
+          }
+
+          override def next(): Iterator[(InternalRow, InternalRow)] = {
+            val rightRow = context.sparkRow.replace(reader.next())
+            val rowId = rightRow.getLong(context.rowIdOrdinal)
+            rowIdToMatches.getOrElse(rowId, Seq.empty).iterator.map {
+              searchMatch =>
+                val projectedRow = projectRightRow(rightRow, searchMatch, context)
+                (searchMatch.outerRow, projectedRow)
+            }
+          }
+        }.flatMap(identity)
+    }
   }
 
   private def createRowIdToMatches(
@@ -806,6 +1185,10 @@ case class LateralVectorSearchExec(
       case _ =>
         throw new RuntimeException(s"Cannot extract query vector from expression value: $value")
     }
+  }
+
+  private def vectorPlan(context: LateralVectorSearchContext): VectorScan.Plan = {
+    context.vectorPlan.getOrElse(context.vectorSearchBuilder.newVectorScan().scan())
   }
 
   private class LateralVectorSearchReaderTracker {
@@ -858,19 +1241,36 @@ case class LateralVectorSearchExec(
       readBuilder: ReadBuilder,
       physicalReadBuilder: ReadBuilder,
       vectorSearchBuilder: BatchVectorSearchBuilder,
-      vectorPlan: VectorScan.Plan,
+      routingVectorSearchBuilder: BatchVectorSearchBuilder,
+      vectorPlan: Option[VectorScan.Plan],
       scoreMetadataColumns: Seq[PaimonMetadataColumn],
       sparkRow: SparkInternalRow,
       rowIdOrdinal: Int,
       metaColumnsOnly: Boolean,
       projectionInputOrdinals: Seq[Int],
       rightProjection: UnsafeProjection,
+      resultVectorSearchOutput: Seq[Attribute],
       batchSize: Int,
       readerTracker: LateralVectorSearchReaderTracker)
 
   private case class LateralVectorSearchQuery(outerRow: InternalRow, queryVector: Array[Float])
 
   private case class LateralVectorSearchMatch(outerRow: InternalRow, score: Float)
+
+  private def sortPartitionBasedMatches(
+      matches: Seq[PartitionBasedMatch]): Seq[PartitionBasedMatch] = {
+    matches.sortBy(matchResult => (-matchResult.score, matchResult.rowId))
+  }
+
+  private def trimPartitionBasedMatches(
+      matches: ArrayBuffer[PartitionBasedMatch]): ArrayBuffer[PartitionBasedMatch] = {
+    if (matches.size > limit) {
+      val topK = sortPartitionBasedMatches(matches).take(limit)
+      matches.clear()
+      matches ++= topK
+    }
+    matches
+  }
 
   private case class LateralVectorSearchPhysicalFile(
       partition: BinaryRow,
@@ -904,5 +1304,48 @@ case class LateralVectorSearchExec(
         position.dataFileName(),
         position.rowPosition())
     }
+  }
+}
+
+/** Spark physical node for the partition-based lateral vector search mode. */
+class PartitionBasedLateralVectorSearchExec(
+    override val innerTable: InnerTable,
+    override val columnName: String,
+    override val queryVectorExpr: Expression,
+    override val limit: Int,
+    override val options: Map[String, String],
+    override val vectorSearchOutput: Seq[Attribute],
+    override val projectList: Seq[Expression],
+    override val projectOutput: Seq[Attribute],
+    override val searchFilters: Seq[Expression],
+    override val child: SparkPlan,
+    override val planVectorSearchPerBatch: Boolean = true)
+  extends LateralVectorSearchExec(
+    innerTable,
+    columnName,
+    queryVectorExpr,
+    limit,
+    options,
+    vectorSearchOutput,
+    projectList,
+    projectOutput,
+    searchFilters,
+    child,
+    planVectorSearchPerBatch) {
+
+  override protected def withNewChildrenInternal(newChildren: IndexedSeq[SparkPlan]): SparkPlan = {
+    new PartitionBasedLateralVectorSearchExec(
+      innerTable,
+      columnName,
+      queryVectorExpr,
+      limit,
+      options,
+      vectorSearchOutput,
+      projectList,
+      projectOutput,
+      searchFilters,
+      newChildren.head,
+      planVectorSearchPerBatch
+    )
   }
 }

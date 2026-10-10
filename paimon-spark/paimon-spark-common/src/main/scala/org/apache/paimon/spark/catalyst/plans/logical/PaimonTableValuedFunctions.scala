@@ -21,13 +21,13 @@ package org.apache.paimon.spark.catalyst.plans.logical
 import org.apache.paimon.CoreOptions
 import org.apache.paimon.globalindex.HybridSearchRanker
 import org.apache.paimon.predicate.{FullTextSearch, HybridSearch, HybridSearchRoute, Predicate, VectorSearch}
-import org.apache.paimon.spark.{SparkTable, SparkTypeUtils, SparkV2FilterConverter}
+import org.apache.paimon.spark.{SparkFilterConverter, SparkTable, SparkTypeUtils}
 import org.apache.paimon.spark.catalyst.plans.logical.PaimonTableValuedFunctions._
 import org.apache.paimon.spark.schema.PaimonMetadataColumn
 import org.apache.paimon.table.{DataTable, FullTextSearchTable, HybridSearchTable, InnerTable, VectorSearchTable}
 import org.apache.paimon.table.source.snapshot.TimeTravelUtil.InconsistentTagBucketException
 
-import org.apache.spark.sql.PaimonUtils.{createDataset, normalizeExprs, toAttributes, translateFilterV2}
+import org.apache.spark.sql.PaimonUtils.{createDataset, normalizeExprs, toAttributes, translateFilter}
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.FunctionIdentifier
 import org.apache.spark.sql.catalyst.analysis.FunctionRegistryBase
@@ -257,7 +257,7 @@ object PaimonTableValuedFunctions {
       projectList: Seq[Expression],
       projectOutput: Seq[Attribute],
       filters: Seq[Expression]): Option[Seq[Predicate]] = {
-    val converter = SparkV2FilterConverter(innerTable.rowType())
+    val converter = new SparkFilterConverter(innerTable.rowType())
     val projectionByExprId = projectList
       .zip(projectOutput)
       .map { case (project, outputAttr) => outputAttr.exprId -> stripAlias(project) }
@@ -268,7 +268,8 @@ object PaimonTableValuedFunctions {
         .flatMap(splitConjunctivePredicatesForFilter)
         .foreach {
           filter =>
-            translateFilterV2(filter).flatMap(converter.convert(_)) match {
+            translateFilter(filter, supportNestedPredicatePushdown = true)
+              .map(converter.convert) match {
               case Some(predicate) => predicates += predicate
               case None => return None
             }
@@ -898,6 +899,54 @@ case class LateralVectorSearch(
 
   override protected def withNewChildInternal(newChild: LogicalPlan): LogicalPlan = {
     copy(left = newChild)
+  }
+}
+
+case class PartitionBasedLateralVectorSearch(
+    left: LogicalPlan,
+    innerTable: InnerTable,
+    columnName: String,
+    queryVectorExpr: Expression,
+    limit: Int,
+    options: Map[String, String],
+    vectorSearchOutput: Seq[Attribute],
+    projectList: Seq[Expression],
+    projectOutput: Seq[Attribute],
+    searchFilters: Seq[Expression] = Nil)
+  extends UnaryNode {
+
+  override def child: LogicalPlan = left
+
+  override def output: Seq[Attribute] = left.output ++ projectOutput
+
+  override lazy val producedAttributes: AttributeSet = {
+    AttributeSet(vectorSearchOutput ++ output.filterNot(attr => inputSet.contains(attr)))
+  }
+
+  override lazy val references: AttributeSet = {
+    AttributeSet.fromAttributeSets(expressions.map(_.references)) -- producedAttributes
+  }
+
+  override protected def withNewChildInternal(newChild: LogicalPlan): LogicalPlan = {
+    copy(left = newChild)
+  }
+}
+
+object PartitionBasedLateralVectorSearch {
+
+  def from(lateralVectorSearch: LateralVectorSearch): PartitionBasedLateralVectorSearch = {
+    PartitionBasedLateralVectorSearch(
+      lateralVectorSearch.left,
+      lateralVectorSearch.innerTable,
+      lateralVectorSearch.columnName,
+      lateralVectorSearch.queryVectorExpr,
+      lateralVectorSearch.limit,
+      lateralVectorSearch.options,
+      lateralVectorSearch.vectorSearchOutput,
+      lateralVectorSearch.projectList,
+      lateralVectorSearch.projectOutput,
+      lateralVectorSearch.searchFilters
+    )
   }
 }
 
