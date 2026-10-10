@@ -206,6 +206,9 @@ public class OffsetGlobalIndexReader implements ContainsRefiningGlobalIndexReade
     @Override
     public CompletableFuture<Optional<ScoredGlobalIndexResult>> visitVectorSearch(
             VectorSearch vectorSearch) {
+        if (wrapped.returnsAbsoluteRowIds()) {
+            return wrapped.visitVectorSearch(vectorSearch);
+        }
         return wrapped.visitVectorSearch(vectorSearch.offsetRange(this.offset, this.to))
                 .thenApply(opt -> opt.map(r -> r.offset(offset)));
     }
@@ -220,6 +223,9 @@ public class OffsetGlobalIndexReader implements ContainsRefiningGlobalIndexReade
     @Override
     public CompletableFuture<List<Optional<ScoredGlobalIndexResult>>> visitBatchVectorSearch(
             BatchVectorSearch batchVectorSearch) {
+        if (wrapped.returnsAbsoluteRowIds()) {
+            return wrapped.visitBatchVectorSearch(batchVectorSearch);
+        }
         return wrapped.visitBatchVectorSearch(batchVectorSearch.offsetRange(this.offset, this.to))
                 .thenApply(
                         results -> {

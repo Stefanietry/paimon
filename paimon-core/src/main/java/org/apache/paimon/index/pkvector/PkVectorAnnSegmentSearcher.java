@@ -199,7 +199,8 @@ public class PkVectorAnnSegmentSearcher {
                 new GlobalIndexIOMeta(
                         annSegmentFile.path(segment),
                         segment.fileSize(),
-                        globalIndexMeta.indexMeta());
+                        globalIndexMeta.indexMeta(),
+                        segment.fileKind());
         GlobalIndexReader reader =
                 indexer.createReader(
                         meta -> fileIO.newInputStream(meta.filePath()),
@@ -298,7 +299,8 @@ public class PkVectorAnnSegmentSearcher {
                 new GlobalIndexIOMeta(
                         annSegmentFile.path(segment),
                         segment.fileSize(),
-                        globalIndexMeta.indexMeta());
+                        globalIndexMeta.indexMeta(),
+                        segment.fileKind());
         GlobalIndexReader reader =
                 indexer.createReader(
                         meta -> fileIO.newInputStream(meta.filePath()),

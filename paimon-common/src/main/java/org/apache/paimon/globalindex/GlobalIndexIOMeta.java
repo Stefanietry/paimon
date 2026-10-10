@@ -20,6 +20,8 @@ package org.apache.paimon.globalindex;
 
 import org.apache.paimon.fs.Path;
 
+import javax.annotation.Nullable;
+
 import java.util.Arrays;
 import java.util.Objects;
 
@@ -30,16 +32,32 @@ public class GlobalIndexIOMeta {
     private final long fileSize;
     private final long rowCount;
     private final byte[] metadata;
+    @Nullable private final IndexFileKind fileKind;
 
     public GlobalIndexIOMeta(Path filePath, long fileSize, byte[] metadata) {
-        this(filePath, fileSize, -1, metadata);
+        this(filePath, fileSize, -1, metadata, null);
     }
 
     public GlobalIndexIOMeta(Path filePath, long fileSize, long rowCount, byte[] metadata) {
+        this(filePath, fileSize, rowCount, metadata, null);
+    }
+
+    public GlobalIndexIOMeta(
+            Path filePath, long fileSize, byte[] metadata, @Nullable IndexFileKind fileKind) {
+        this(filePath, fileSize, -1, metadata, fileKind);
+    }
+
+    public GlobalIndexIOMeta(
+            Path filePath,
+            long fileSize,
+            long rowCount,
+            byte[] metadata,
+            @Nullable IndexFileKind fileKind) {
         this.filePath = filePath;
         this.fileSize = fileSize;
         this.rowCount = rowCount;
         this.metadata = metadata;
+        this.fileKind = fileKind;
     }
 
     public Path filePath() {
@@ -59,6 +77,11 @@ public class GlobalIndexIOMeta {
         return metadata;
     }
 
+    @Nullable
+    public IndexFileKind fileKind() {
+        return fileKind;
+    }
+
     @Override
     public boolean equals(Object o) {
         if (this == o) {
@@ -71,13 +94,26 @@ public class GlobalIndexIOMeta {
         return Objects.equals(filePath, that.filePath)
                 && fileSize == that.fileSize
                 && rowCount == that.rowCount
-                && Arrays.equals(metadata, that.metadata);
+                && Arrays.equals(metadata, that.metadata)
+                && fileKind == that.fileKind;
     }
 
     @Override
     public int hashCode() {
-        int result = Objects.hash(filePath, fileSize, rowCount);
+        int result = Objects.hash(filePath, fileSize, rowCount, fileKind);
         result = 31 * result + Arrays.hashCode(metadata);
         return result;
+    }
+
+    @Override
+    public String toString() {
+        return "GlobalIndexIOMeta{"
+                + "filePath="
+                + filePath
+                + ", fileSize="
+                + fileSize
+                + ", fileKind="
+                + fileKind
+                + '}';
     }
 }

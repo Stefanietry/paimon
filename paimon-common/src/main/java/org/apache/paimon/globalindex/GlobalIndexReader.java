@@ -42,6 +42,11 @@ public interface GlobalIndexReader
         return CompletableFuture.completedFuture(Optional.empty());
     }
 
+    /** Returns whether row ids produced by this reader are already absolute table row ids. */
+    default boolean returnsAbsoluteRowIds() {
+        return false;
+    }
+
     @Override
     default CompletableFuture<Optional<GlobalIndexResult>> visitIsNaN(FieldRef fieldRef) {
         return CompletableFuture.completedFuture(Optional.empty());
