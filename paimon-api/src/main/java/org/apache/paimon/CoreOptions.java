@@ -3007,6 +3007,13 @@ public class CoreOptions implements Serializable {
                             "Query supported scalar global indexes per data split in readers "
                                     + "instead of materializing index results during scan planning.");
 
+    public static final ConfigOption<Integer> GLOBAL_INDEX_BUILD_CENTROID_ASSIGN_BATCH_SIZE =
+            key("global-index.build.centroid-assign-batch-size")
+                    .intType()
+                    .defaultValue(4096)
+                    .withDescription(
+                            "Batch size for assigning vectors to centroids when building centroid-sharded IVF global index.");
+
     public static final ConfigOption<Boolean> GLOBAL_INDEX_ENABLED =
             key("global-index.enabled")
                     .booleanType()
@@ -4843,6 +4850,10 @@ public class CoreOptions implements Serializable {
 
     public long globalIndexTrainSampleRows() {
         return options.get(GLOBAL_INDEX_TRAIN_SAMPLE_ROWS);
+    }
+
+    public int globalIndexBuildCentroidAssignBatchSize() {
+        return options.get(GLOBAL_INDEX_BUILD_CENTROID_ASSIGN_BATCH_SIZE);
     }
 
     public boolean globalIndexEnabled() {

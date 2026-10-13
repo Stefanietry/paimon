@@ -69,12 +69,21 @@ class CentroidShardedIvfIndexBuilder implements Serializable, AutoCloseable {
     @Nullable private final String trainingModelIndexType;
     @Nullable private final byte[] trainingModelPayload;
     private final Map<String, String> nativeOptions;
+    private final int centroidAssignBatchSize;
 
     /** Creates a builder used by scan-side tasks to collect centroid training samples. */
     static CentroidShardedIvfIndexBuilder forTrainingSamples(
             FileStoreTable table, RowType readType, DataField indexField, List<Range> rowRanges) {
         return new CentroidShardedIvfIndexBuilder(
-                table, readType, indexField, rowRanges, null, null, null, Collections.emptyMap());
+                table,
+                readType,
+                indexField,
+                rowRanges,
+                null,
+                null,
+                null,
+                Collections.emptyMap(),
+                1);
     }
 
     /** Creates a builder used by scan-side tasks to add vectors into centroid buckets. */
@@ -85,7 +94,8 @@ class CentroidShardedIvfIndexBuilder implements Serializable, AutoCloseable {
             List<Range> rowRanges,
             String indexType,
             Map<String, String> nativeOptions,
-            byte[] trainingModelPayload) {
+            byte[] trainingModelPayload,
+            int centroidAssignBatchSize) {
         return new CentroidShardedIvfIndexBuilder(
                 table,
                 readType,
@@ -94,7 +104,8 @@ class CentroidShardedIvfIndexBuilder implements Serializable, AutoCloseable {
                 null,
                 indexType,
                 trainingModelPayload,
-                nativeOptions);
+                nativeOptions,
+                centroidAssignBatchSize);
     }
 
     /** Creates a builder used by shuffle-side tasks to write one or more centroid shard files. */
@@ -111,7 +122,8 @@ class CentroidShardedIvfIndexBuilder implements Serializable, AutoCloseable {
                 null,
                 indexType,
                 trainingModelPayload,
-                nativeOptions);
+                nativeOptions,
+                1);
     }
 
     /** Creates a builder used by driver to write the partition-level global index file. */
@@ -128,7 +140,8 @@ class CentroidShardedIvfIndexBuilder implements Serializable, AutoCloseable {
                 trainingModel,
                 indexType,
                 null,
-                nativeOptions);
+                nativeOptions,
+                1);
     }
 
     private CentroidShardedIvfIndexBuilder(
@@ -139,7 +152,8 @@ class CentroidShardedIvfIndexBuilder implements Serializable, AutoCloseable {
             @Nullable VectorTrainingModel trainingModel,
             @Nullable String trainingModelIndexType,
             @Nullable byte[] trainingModelPayload,
-            Map<String, String> nativeOptions) {
+            Map<String, String> nativeOptions,
+            int centroidAssignBatchSize) {
         this.table = table;
         this.readType = readType;
         this.indexField = indexField;
@@ -149,6 +163,7 @@ class CentroidShardedIvfIndexBuilder implements Serializable, AutoCloseable {
         this.trainingModelPayload =
                 trainingModelPayload == null ? null : trainingModelPayload.clone();
         this.nativeOptions = new LinkedHashMap<>(nativeOptions);
+        this.centroidAssignBatchSize = centroidAssignBatchSize;
     }
 
     FileStoreTable table() {
@@ -207,31 +222,32 @@ class CentroidShardedIvfIndexBuilder implements Serializable, AutoCloseable {
 
             private final InternalRow.FieldGetter vectorGetter = vectorGetter();
             private final int rowIdIndex = rowIdIndex();
-            private Tuple2<Integer, AssignedVector> next;
-            private boolean nextReady;
+            private final IvfRoutingModel routingModel = routingModel();
+            private Iterator<Tuple2<Integer, AssignedVector>> assignedBatch =
+                    Collections.emptyIterator();
 
             @Override
             public boolean hasNext() {
-                prepareNext();
-                return nextReady;
+                prepareBatch();
+                return assignedBatch.hasNext();
             }
 
             @Override
             public Tuple2<Integer, AssignedVector> next() {
-                prepareNext();
-                if (!nextReady) {
+                prepareBatch();
+                if (!assignedBatch.hasNext()) {
                     throw new NoSuchElementException();
                 }
-                Tuple2<Integer, AssignedVector> result = next;
-                next = null;
-                nextReady = false;
-                return result;
+                return assignedBatch.next();
             }
 
-            private void prepareNext() {
-                if (nextReady) {
+            private void prepareBatch() {
+                if (assignedBatch.hasNext()) {
                     return;
                 }
+
+                List<AssignedVector> vectors = new ArrayList<>(centroidAssignBatchSize);
+                int dimension = -1;
                 while (rows.hasNext()) {
                     InternalRow row = rows.next();
                     long absoluteRowId = row.getLong(rowIdIndex);
@@ -243,11 +259,46 @@ class CentroidShardedIvfIndexBuilder implements Serializable, AutoCloseable {
                         continue;
                     }
                     float[] vector = toFloatVector(vectorObject);
-                    int centroid = routingModel().assignCentroid(vector);
-                    next = new Tuple2<>(centroid, new AssignedVector(absoluteRowId, vector));
-                    nextReady = true;
+                    if (dimension < 0) {
+                        dimension = vector.length;
+                    } else if (vector.length != dimension) {
+                        throw new IllegalArgumentException(
+                                String.format(
+                                        "Vector dimension mismatch in centroid assignment batch: expected %d, but got %d",
+                                        dimension, vector.length));
+                    }
+                    vectors.add(new AssignedVector(absoluteRowId, vector));
+                    if (vectors.size() == centroidAssignBatchSize) {
+                        break;
+                    }
+                }
+
+                if (vectors.isEmpty()) {
+                    assignedBatch = Collections.emptyIterator();
                     return;
                 }
+
+                int vectorCount = vectors.size();
+                float[] flattenedVectors =
+                        new float[checkedFlattenedVectorLength(vectorCount, dimension)];
+                for (int i = 0; i < vectorCount; i++) {
+                    float[] vector = vectors.get(i).vector;
+                    System.arraycopy(vector, 0, flattenedVectors, i * dimension, dimension);
+                }
+
+                int[] centroids = routingModel.assignCentroids(flattenedVectors, vectorCount);
+                if (centroids.length != vectorCount) {
+                    throw new IllegalStateException(
+                            String.format(
+                                    "Centroid assignment result size mismatch: expected %d, but got %d",
+                                    vectorCount, centroids.length));
+                }
+
+                List<Tuple2<Integer, AssignedVector>> assigned = new ArrayList<>(vectorCount);
+                for (int i = 0; i < vectorCount; i++) {
+                    assigned.add(new Tuple2<>(centroids[i], vectors.get(i)));
+                }
+                assignedBatch = assigned.iterator();
             }
         };
     }
@@ -337,6 +388,23 @@ class CentroidShardedIvfIndexBuilder implements Serializable, AutoCloseable {
             to = Math.max(to, range.to);
         }
         return new Range(from, to);
+    }
+
+    private static int checkedFlattenedVectorLength(int vectorCount, int dimension) {
+        if (vectorCount < 0) {
+            throw new IllegalArgumentException("vectorCount must not be negative: " + vectorCount);
+        }
+        if (dimension <= 0) {
+            throw new IllegalArgumentException("dimension must be positive: " + dimension);
+        }
+        long length = (long) vectorCount * dimension;
+        if (length > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException(
+                    String.format(
+                            "Centroid assignment batch is too large: vectorCount=%d, dimension=%d",
+                            vectorCount, dimension));
+        }
+        return (int) length;
     }
 
     private static void collectNativeOptions(

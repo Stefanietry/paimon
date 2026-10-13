@@ -66,6 +66,7 @@ import java.util.UUID;
 
 import scala.Tuple2;
 
+import static org.apache.paimon.CoreOptions.GLOBAL_INDEX_BUILD_CENTROID_ASSIGN_BATCH_SIZE;
 import static org.apache.paimon.CoreOptions.GLOBAL_INDEX_TRAIN_SAMPLE_ROWS;
 import static org.apache.paimon.utils.Preconditions.checkArgument;
 import static org.apache.paimon.vector.index.NativeVectorIndexOptions.CENTROID_TRAIN_MODE_LOCAL;
@@ -124,6 +125,11 @@ class CentroidShardedIvfIndexTopoBuilder {
                 trainingSampleRows > 0,
                 "Option '%s' must be greater than 0.",
                 GLOBAL_INDEX_TRAIN_SAMPLE_ROWS.key());
+        int centroidAssignBatchSize = options.get(GLOBAL_INDEX_BUILD_CENTROID_ASSIGN_BATCH_SIZE);
+        checkArgument(
+                centroidAssignBatchSize > 0,
+                "Option '%s' must be greater than 0.",
+                GLOBAL_INDEX_BUILD_CENTROID_ASSIGN_BATCH_SIZE.key());
         List<IndexedSplit> trainingSplits =
                 limitSplitsToTrainingSampleRows(splits, trainingSampleRows);
         IvfTrainingModel trainingModel;
@@ -145,6 +151,7 @@ class CentroidShardedIvfIndexTopoBuilder {
                             trainingModel,
                             indexType,
                             nativeOptions,
+                            centroidAssignBatchSize,
                             options);
             if (resultEntries.isEmpty()) {
                 return Collections.emptyList();
@@ -256,6 +263,7 @@ class CentroidShardedIvfIndexTopoBuilder {
             IvfTrainingModel trainingModel,
             String indexType,
             Map<String, String> nativeOptions,
+            int centroidAssignBatchSize,
             Options options)
             throws IOException {
         JavaSparkContext javaSparkContext = new JavaSparkContext(spark.sparkContext());
@@ -273,7 +281,8 @@ class CentroidShardedIvfIndexTopoBuilder {
                         Collections.emptyList(),
                         indexType,
                         nativeOptions,
-                        trainingModelPayload);
+                        trainingModelPayload,
+                        centroidAssignBatchSize);
         Broadcast<byte[]> assignBuilderBytes =
                 javaSparkContext.broadcast(InstantiationUtil.serializeObject(assignBuilder));
 

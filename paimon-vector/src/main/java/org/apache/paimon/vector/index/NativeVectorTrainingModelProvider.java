@@ -362,6 +362,11 @@ public class NativeVectorTrainingModelProvider implements VectorTrainingModelPro
         }
 
         @Override
+        public int[] assignCentroids(float[] vectors, int vectorCount) {
+            return training.assignCentroids(vectors, vectorCount);
+        }
+
+        @Override
         public int[] nearestCentroids(float[] queryVector, int nprobe) {
             return training.findNearestCentroids(queryVector, nprobe);
         }

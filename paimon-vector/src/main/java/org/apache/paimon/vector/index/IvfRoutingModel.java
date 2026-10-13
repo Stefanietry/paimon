@@ -25,5 +25,7 @@ public interface IvfRoutingModel {
 
     int assignCentroid(float[] vector);
 
+    int[] assignCentroids(float[] vectors, int vectorCount);
+
     int[] nearestCentroids(float[] queryVector, int nprobe);
 }
