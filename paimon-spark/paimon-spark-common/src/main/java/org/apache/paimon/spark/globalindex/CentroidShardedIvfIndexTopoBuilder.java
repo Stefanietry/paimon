@@ -49,10 +49,12 @@ import org.apache.paimon.vector.index.VectorTrainingModel;
 import org.apache.paimon.vector.index.VectorTrainingModelProviderRegistry;
 
 import org.apache.spark.Partitioner;
+import org.apache.spark.TaskContext;
 import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.broadcast.Broadcast;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.util.TaskCompletionListener;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -422,7 +424,19 @@ class CentroidShardedIvfIndexTopoBuilder {
         indexBuilder.attachTrainingModelPayload(trainingModelPayloadBytes.value());
         ReadBuilder builder = indexBuilder.table().newReadBuilder();
         builder.withReadType(indexBuilder.readType());
-        return new CentroidAssignmentPartitionIterator(indexBuilder, builder, splitPayloads);
+        CentroidAssignmentPartitionIterator iterator =
+                new CentroidAssignmentPartitionIterator(indexBuilder, builder, splitPayloads);
+        TaskContext taskContext = TaskContext.get();
+        if (taskContext != null) {
+            taskContext.addTaskCompletionListener(
+                    new TaskCompletionListener() {
+                        @Override
+                        public void onTaskCompletion(TaskContext context) {
+                            iterator.closeOnTaskCompletion();
+                        }
+                    });
+        }
+        return iterator;
     }
 
     private static Iterator<Tuple2<Integer, CentroidShardedIvfIndexBuilder.AssignedVector>>
@@ -577,10 +591,23 @@ class CentroidShardedIvfIndexTopoBuilder {
                 return;
             }
             closed = true;
+            RuntimeException error = null;
+            try {
+                closeAssignedVectors();
+            } catch (Exception e) {
+                error = new RuntimeException("Failed to close centroid assignment iterator.", e);
+            }
             try {
                 indexBuilder.close();
             } catch (Exception e) {
-                throw new RuntimeException("Failed to close centroid assignment builder.", e);
+                if (error == null) {
+                    error = new RuntimeException("Failed to close centroid assignment builder.", e);
+                } else {
+                    error.addSuppressed(e);
+                }
+            }
+            if (error != null) {
+                throw error;
             }
         }
 
@@ -589,11 +616,46 @@ class CentroidShardedIvfIndexTopoBuilder {
                 return;
             }
             closed = true;
+            closeAssignedVectorsQuietly(error);
             CentroidShardedIvfIndexTopoBuilder.closeQuietly(indexBuilder, error);
+        }
+
+        private void closeOnTaskCompletion() {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            try {
+                closeAssignedVectors();
+            } catch (Exception e) {
+                LOG.warn("Failed to close centroid assignment iterator on task completion.", e);
+            }
+            try {
+                indexBuilder.close();
+            } catch (Exception e) {
+                LOG.warn("Failed to close centroid assignment builder on task completion.", e);
+            }
+        }
+
+        private void closeAssignedVectors() throws Exception {
+            if (assignedVectors instanceof AutoCloseable) {
+                ((AutoCloseable) assignedVectors).close();
+            }
+        }
+
+        private void closeAssignedVectorsQuietly(Throwable error) {
+            if (!(assignedVectors instanceof AutoCloseable)) {
+                return;
+            }
+            try {
+                ((AutoCloseable) assignedVectors).close();
+            } catch (Throwable closeError) {
+                error.addSuppressed(closeError);
+            }
         }
     }
 
-    private static class ClosingIterator<T> implements Iterator<T> {
+    private static class ClosingIterator<T> implements Iterator<T>, AutoCloseable {
 
         private final Iterator<T> delegate;
         private final AutoCloseable[] closeables;
@@ -628,7 +690,8 @@ class CentroidShardedIvfIndexTopoBuilder {
             }
         }
 
-        private void close() {
+        @Override
+        public void close() {
             if (closed) {
                 return;
             }

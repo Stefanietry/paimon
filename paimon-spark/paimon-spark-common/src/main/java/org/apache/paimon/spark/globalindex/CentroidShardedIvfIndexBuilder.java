@@ -46,6 +46,7 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.io.Serializable;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -60,6 +61,7 @@ import scala.Tuple2;
 class CentroidShardedIvfIndexBuilder implements Serializable, AutoCloseable {
 
     private static final long serialVersionUID = 1L;
+    private static final int INITIAL_CENTROID_ASSIGN_VECTOR_BUFFER_SIZE = 64;
 
     private final FileStoreTable table;
     private final RowType readType;
@@ -253,8 +255,11 @@ class CentroidShardedIvfIndexBuilder implements Serializable, AutoCloseable {
                     return;
                 }
 
-                List<AssignedVector> vectors = new ArrayList<>(centroidAssignBatchSize);
+                int vectorCapacity = initialVectorBufferCapacity(centroidAssignBatchSize);
+                long[] rowIds = new long[vectorCapacity];
+                float[] flattenedVectors = null;
                 int dimension = -1;
+                int vectorCount = 0;
                 while (rows.hasNext()) {
                     InternalRow row = rows.next();
                     long absoluteRowId = row.getLong(rowIdIndex);
@@ -268,32 +273,44 @@ class CentroidShardedIvfIndexBuilder implements Serializable, AutoCloseable {
                     float[] vector = toFloatVector(vectorObject);
                     if (dimension < 0) {
                         dimension = vector.length;
+                        flattenedVectors =
+                                new float[checkedFlattenedVectorLength(vectorCapacity, dimension)];
                     } else if (vector.length != dimension) {
                         throw new IllegalArgumentException(
                                 String.format(
                                         "Vector dimension mismatch in centroid assignment batch: expected %d, but got %d",
                                         dimension, vector.length));
                     }
-                    vectors.add(new AssignedVector(absoluteRowId, vector));
-                    if (vectors.size() == centroidAssignBatchSize) {
+                    if (vectorCount == vectorCapacity) {
+                        vectorCapacity =
+                                growVectorBufferCapacity(vectorCapacity, centroidAssignBatchSize);
+                        rowIds = Arrays.copyOf(rowIds, vectorCapacity);
+                        flattenedVectors =
+                                Arrays.copyOf(
+                                        flattenedVectors,
+                                        checkedFlattenedVectorLength(vectorCapacity, dimension));
+                    }
+                    rowIds[vectorCount] = absoluteRowId;
+                    System.arraycopy(
+                            vector, 0, flattenedVectors, vectorCount * dimension, dimension);
+                    vectorCount++;
+                    if (vectorCount == centroidAssignBatchSize) {
                         break;
                     }
                 }
 
-                if (vectors.isEmpty()) {
+                if (vectorCount == 0) {
                     assignedBatch = Collections.emptyIterator();
                     return;
                 }
 
-                int vectorCount = vectors.size();
-                float[] flattenedVectors =
-                        new float[checkedFlattenedVectorLength(vectorCount, dimension)];
-                for (int i = 0; i < vectorCount; i++) {
-                    float[] vector = vectors.get(i).vector;
-                    System.arraycopy(vector, 0, flattenedVectors, i * dimension, dimension);
-                }
-
-                int[] centroids = routingModel.assignCentroids(flattenedVectors, vectorCount);
+                float[] vectorsToAssign =
+                        vectorCount == vectorCapacity
+                                ? flattenedVectors
+                                : Arrays.copyOf(
+                                        flattenedVectors,
+                                        checkedFlattenedVectorLength(vectorCount, dimension));
+                int[] centroids = routingModel.assignCentroids(vectorsToAssign, vectorCount);
                 if (centroids.length != vectorCount) {
                     throw new IllegalStateException(
                             String.format(
@@ -303,7 +320,12 @@ class CentroidShardedIvfIndexBuilder implements Serializable, AutoCloseable {
 
                 List<Tuple2<Integer, AssignedVector>> assigned = new ArrayList<>(vectorCount);
                 for (int i = 0; i < vectorCount; i++) {
-                    assigned.add(new Tuple2<>(centroids[i], vectors.get(i)));
+                    float[] vector = new float[dimension];
+                    System.arraycopy(vectorsToAssign, i * dimension, vector, 0, dimension);
+                    assigned.add(
+                            new Tuple2<>(
+                                    centroids[i],
+                                    AssignedVector.fromOwnedVector(rowIds[i], vector)));
                 }
                 assignedBatch = assigned.iterator();
             }
@@ -412,6 +434,14 @@ class CentroidShardedIvfIndexBuilder implements Serializable, AutoCloseable {
                             vectorCount, dimension));
         }
         return (int) length;
+    }
+
+    private static int initialVectorBufferCapacity(int maxVectorCount) {
+        return Math.min(maxVectorCount, INITIAL_CENTROID_ASSIGN_VECTOR_BUFFER_SIZE);
+    }
+
+    private static int growVectorBufferCapacity(int currentCapacity, int maxVectorCount) {
+        return (int) Math.min(maxVectorCount, (long) currentCapacity * 2);
     }
 
     private static void collectNativeOptions(
@@ -576,6 +606,15 @@ class CentroidShardedIvfIndexBuilder implements Serializable, AutoCloseable {
         AssignedVector(long absoluteRowId, float[] vector) {
             this.absoluteRowId = absoluteRowId;
             this.vector = vector.clone();
+        }
+
+        private AssignedVector(long absoluteRowId, float[] vector, boolean copyVector) {
+            this.absoluteRowId = absoluteRowId;
+            this.vector = copyVector ? vector.clone() : vector;
+        }
+
+        private static AssignedVector fromOwnedVector(long absoluteRowId, float[] vector) {
+            return new AssignedVector(absoluteRowId, vector, false);
         }
 
         long absoluteRowId() {
