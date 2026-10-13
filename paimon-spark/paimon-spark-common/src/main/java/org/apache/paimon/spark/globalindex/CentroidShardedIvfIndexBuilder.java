@@ -67,7 +67,7 @@ class CentroidShardedIvfIndexBuilder implements Serializable, AutoCloseable {
     private final List<Range> rowRanges;
     @Nullable private transient VectorTrainingModel trainingModel;
     @Nullable private final String trainingModelIndexType;
-    @Nullable private final byte[] trainingModelPayload;
+    @Nullable private byte[] trainingModelPayload;
     private final Map<String, String> nativeOptions;
     private final int centroidAssignBatchSize;
 
@@ -94,7 +94,7 @@ class CentroidShardedIvfIndexBuilder implements Serializable, AutoCloseable {
             List<Range> rowRanges,
             String indexType,
             Map<String, String> nativeOptions,
-            byte[] trainingModelPayload,
+            @Nullable byte[] trainingModelPayload,
             int centroidAssignBatchSize) {
         return new CentroidShardedIvfIndexBuilder(
                 table,
@@ -113,7 +113,7 @@ class CentroidShardedIvfIndexBuilder implements Serializable, AutoCloseable {
             FileStoreTable table,
             String indexType,
             Map<String, String> nativeOptions,
-            byte[] trainingModelPayload) {
+            @Nullable byte[] trainingModelPayload) {
         return new CentroidShardedIvfIndexBuilder(
                 table,
                 null,
@@ -172,6 +172,13 @@ class CentroidShardedIvfIndexBuilder implements Serializable, AutoCloseable {
 
     RowType readType() {
         return readType;
+    }
+
+    void attachTrainingModelPayload(byte[] trainingModelPayload) {
+        if (this.trainingModelPayload == null) {
+            this.trainingModelPayload =
+                    requireNonNull(trainingModelPayload, "trainingModelPayload");
+        }
     }
 
     List<TrainingSample> collectTrainingSamples(CloseableIterator<InternalRow> rows) {

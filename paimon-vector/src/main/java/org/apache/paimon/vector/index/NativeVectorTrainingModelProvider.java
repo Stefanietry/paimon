@@ -28,7 +28,6 @@ import org.apache.paimon.index.vector.VectorIndexWriter;
 
 import javax.annotation.Nullable;
 
-import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -80,8 +79,7 @@ public class NativeVectorTrainingModelProvider implements VectorTrainingModelPro
     public VectorTrainingModel loadModel(
             String indexType, Map<String, String> options, byte[] payload) throws IOException {
         ensureSupported(indexType);
-        return NativeVectorTrainingModel.load(
-                indexType, options, new ByteArrayInputStream(payload));
+        return NativeVectorTrainingModel.load(indexType, options, payload);
     }
 
     private static void ensureSupported(String indexType) {
@@ -274,17 +272,23 @@ public class NativeVectorTrainingModelProvider implements VectorTrainingModelPro
             this.training = training;
         }
 
+        private NativeVectorTrainingModel(
+                String indexType, Map<String, String> options, byte[] serializedTraining) {
+            this.indexType = indexType;
+            this.options = new LinkedHashMap<>(options);
+            this.serializedTraining = serializedTraining;
+        }
+
         static NativeVectorTrainingModel load(
                 String indexType, Map<String, String> options, InputStream payload)
                 throws IOException {
-            byte[] serializedTraining = readFully(payload);
-            NativeVectorTrainingModel model =
-                    new NativeVectorTrainingModel(
-                            indexType,
-                            options,
-                            VectorIndexTraining.deserialize(serializedTraining));
-            model.serializedTraining = serializedTraining;
-            return model;
+            return load(indexType, options, readFully(payload));
+        }
+
+        static NativeVectorTrainingModel load(
+                String indexType, Map<String, String> options, byte[] serializedTraining) {
+            byte[] copiedSerializedTraining = serializedTraining.clone();
+            return new NativeVectorTrainingModel(indexType, options, copiedSerializedTraining);
         }
 
         @Override
@@ -333,9 +337,16 @@ public class NativeVectorTrainingModelProvider implements VectorTrainingModelPro
             return serializedTraining;
         }
 
+        private byte[] requireSerializedTraining() {
+            if (serializedTraining == null) {
+                throw new IllegalStateException("Native vector training model has been closed.");
+            }
+            return serializedTraining;
+        }
+
         private VectorIndexTraining training() {
             if (training == null) {
-                throw new IllegalStateException("Native vector training model has been closed.");
+                training = VectorIndexTraining.deserialize(requireSerializedTraining());
             }
             return training;
         }

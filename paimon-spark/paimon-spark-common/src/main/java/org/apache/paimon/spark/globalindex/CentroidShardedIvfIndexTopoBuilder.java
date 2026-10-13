@@ -272,12 +272,15 @@ class CentroidShardedIvfIndexTopoBuilder {
             int centroidAssignBatchSize,
             Options options)
             throws IOException {
-        JavaSparkContext javaSparkContext = new JavaSparkContext(spark.sparkContext());
-        byte[] trainingModelPayload = serializeTrainingModelPayload(trainingModel);
-        int nlist = trainingModel.routingModel().nlist();
         if (splits.isEmpty()) {
             return Collections.emptyList();
         }
+
+        JavaSparkContext javaSparkContext = new JavaSparkContext(spark.sparkContext());
+        byte[] trainingModelPayload = serializeTrainingModelPayload(trainingModel);
+        Broadcast<byte[]> trainingModelPayloadBytes =
+                javaSparkContext.broadcast(trainingModelPayload);
+        int nlist = trainingModel.routingModel().nlist();
 
         CentroidShardedIvfIndexBuilder assignBuilder =
                 CentroidShardedIvfIndexBuilder.forCentroidAssignment(
@@ -287,7 +290,7 @@ class CentroidShardedIvfIndexTopoBuilder {
                         Collections.emptyList(),
                         indexType,
                         nativeOptions,
-                        trainingModelPayload,
+                        null,
                         centroidAssignBatchSize);
         Broadcast<byte[]> assignBuilderBytes =
                 javaSparkContext.broadcast(InstantiationUtil.serializeObject(assignBuilder));
@@ -304,11 +307,12 @@ class CentroidShardedIvfIndexTopoBuilder {
                         .mapPartitionsToPair(
                                 splitPayloadsInPartition ->
                                         assignCentroidVectorsPartition(
-                                                assignBuilderBytes, splitPayloadsInPartition));
+                                                assignBuilderBytes,
+                                                trainingModelPayloadBytes,
+                                                splitPayloadsInPartition));
 
         CentroidShardedIvfIndexBuilder shardBuilder =
-                CentroidShardedIvfIndexBuilder.forShardBuild(
-                        table, indexType, nativeOptions, trainingModelPayload);
+                CentroidShardedIvfIndexBuilder.forShardBuild(table, indexType, nativeOptions, null);
         Broadcast<byte[]> shardBuilderBytes =
                 javaSparkContext.broadcast(InstantiationUtil.serializeObject(shardBuilder));
         List<byte[]> shardResultBytes;
@@ -317,9 +321,14 @@ class CentroidShardedIvfIndexTopoBuilder {
                     assignedVectors
                             .partitionBy(new CentroidPartitioner(nlist))
                             .mapPartitions(
-                                    partition -> buildShardPartition(partition, shardBuilderBytes))
+                                    partition ->
+                                            buildShardPartition(
+                                                    partition,
+                                                    shardBuilderBytes,
+                                                    trainingModelPayloadBytes))
                             .collect();
         } finally {
+            trainingModelPayloadBytes.destroy(false);
             assignBuilderBytes.destroy(false);
             shardBuilderBytes.destroy(false);
         }
@@ -399,7 +408,9 @@ class CentroidShardedIvfIndexTopoBuilder {
 
     private static Iterator<Tuple2<Integer, CentroidShardedIvfIndexBuilder.AssignedVector>>
             assignCentroidVectorsPartition(
-                    Broadcast<byte[]> indexBuilderBytes, Iterator<byte[]> splitPayloads)
+                    Broadcast<byte[]> indexBuilderBytes,
+                    Broadcast<byte[]> trainingModelPayloadBytes,
+                    Iterator<byte[]> splitPayloads)
                     throws Exception {
         if (!splitPayloads.hasNext()) {
             return Collections.emptyIterator();
@@ -408,6 +419,7 @@ class CentroidShardedIvfIndexTopoBuilder {
         ClassLoader classLoader = CentroidShardedIvfIndexTopoBuilder.class.getClassLoader();
         CentroidShardedIvfIndexBuilder indexBuilder =
                 InstantiationUtil.deserializeObject(indexBuilderBytes.value(), classLoader);
+        indexBuilder.attachTrainingModelPayload(trainingModelPayloadBytes.value());
         ReadBuilder builder = indexBuilder.table().newReadBuilder();
         builder.withReadType(indexBuilder.readType());
         return new CentroidAssignmentPartitionIterator(indexBuilder, builder, splitPayloads);
@@ -437,7 +449,8 @@ class CentroidShardedIvfIndexTopoBuilder {
 
     private static Iterator<byte[]> buildShardPartition(
             Iterator<Tuple2<Integer, CentroidShardedIvfIndexBuilder.AssignedVector>> partition,
-            Broadcast<byte[]> shardBuilderBytes)
+            Broadcast<byte[]> shardBuilderBytes,
+            Broadcast<byte[]> trainingModelPayloadBytes)
             throws Exception {
         if (!partition.hasNext()) {
             return Collections.emptyIterator();
@@ -446,6 +459,7 @@ class CentroidShardedIvfIndexTopoBuilder {
         ClassLoader classLoader = CentroidShardedIvfIndexTopoBuilder.class.getClassLoader();
         CentroidShardedIvfIndexBuilder indexBuilder =
                 InstantiationUtil.deserializeObject(shardBuilderBytes.value(), classLoader);
+        indexBuilder.attachTrainingModelPayload(trainingModelPayloadBytes.value());
         try {
             List<byte[]> resultEntries = new ArrayList<>();
             for (CentroidShardedIvfIndexBuilder.ShardBuildResult result :
