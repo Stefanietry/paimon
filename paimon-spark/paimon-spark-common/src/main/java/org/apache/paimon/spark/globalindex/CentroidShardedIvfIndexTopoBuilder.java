@@ -53,6 +53,8 @@ import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.broadcast.Broadcast;
 import org.apache.spark.sql.SparkSession;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -62,6 +64,7 @@ import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.NoSuchElementException;
 import java.util.UUID;
 
 import scala.Tuple2;
@@ -77,6 +80,9 @@ import static org.apache.paimon.vector.index.NativeVectorIndexOptions.VECTOR_ROU
 
 /** Topology builder for centroid-sharded IVF global indexes. */
 class CentroidShardedIvfIndexTopoBuilder {
+
+    private static final Logger LOG =
+            LoggerFactory.getLogger(CentroidShardedIvfIndexTopoBuilder.class);
 
     List<CommitMessage> buildIndex(
             SparkSession spark,
@@ -287,13 +293,18 @@ class CentroidShardedIvfIndexTopoBuilder {
                 javaSparkContext.broadcast(InstantiationUtil.serializeObject(assignBuilder));
 
         int scanParallelism = DefaultGlobalIndexTopoBuilder.parallelism(splits.size(), options);
+        LOG.info(
+                "Building centroid-sharded IVF data shards with split size {} and scan parallelism {}.",
+                splits.size(),
+                scanParallelism);
         List<byte[]> splitPayloads = serializeIndexedSplitPayloads(splits);
         JavaPairRDD<Integer, CentroidShardedIvfIndexBuilder.AssignedVector> assignedVectors =
                 javaSparkContext
                         .parallelize(splitPayloads, scanParallelism)
-                        .flatMapToPair(
-                                splitPayload ->
-                                        assignCentroidVectors(assignBuilderBytes, splitPayload));
+                        .mapPartitionsToPair(
+                                splitPayloadsInPartition ->
+                                        assignCentroidVectorsPartition(
+                                                assignBuilderBytes, splitPayloadsInPartition));
 
         CentroidShardedIvfIndexBuilder shardBuilder =
                 CentroidShardedIvfIndexBuilder.forShardBuild(
@@ -387,21 +398,27 @@ class CentroidShardedIvfIndexTopoBuilder {
     }
 
     private static Iterator<Tuple2<Integer, CentroidShardedIvfIndexBuilder.AssignedVector>>
-            assignCentroidVectors(Broadcast<byte[]> indexBuilderBytes, byte[] splitPayload)
+            assignCentroidVectorsPartition(
+                    Broadcast<byte[]> indexBuilderBytes, Iterator<byte[]> splitPayloads)
                     throws Exception {
-        return assignCentroidVectors(
-                indexBuilderBytes, deserializeIndexedSplitPayload(splitPayload));
-    }
+        if (!splitPayloads.hasNext()) {
+            return Collections.emptyIterator();
+        }
 
-    private static Iterator<Tuple2<Integer, CentroidShardedIvfIndexBuilder.AssignedVector>>
-            assignCentroidVectors(Broadcast<byte[]> indexBuilderBytes, IndexedSplit split)
-                    throws Exception {
         ClassLoader classLoader = CentroidShardedIvfIndexTopoBuilder.class.getClassLoader();
         CentroidShardedIvfIndexBuilder indexBuilder =
                 InstantiationUtil.deserializeObject(indexBuilderBytes.value(), classLoader);
         ReadBuilder builder = indexBuilder.table().newReadBuilder();
         builder.withReadType(indexBuilder.readType());
+        return new CentroidAssignmentPartitionIterator(indexBuilder, builder, splitPayloads);
+    }
 
+    private static Iterator<Tuple2<Integer, CentroidShardedIvfIndexBuilder.AssignedVector>>
+            assignCentroidVectors(
+                    CentroidShardedIvfIndexBuilder indexBuilder,
+                    ReadBuilder builder,
+                    IndexedSplit split)
+                    throws Exception {
         RecordReader<InternalRow> recordReader = null;
         CloseableIterator<InternalRow> data = null;
         try {
@@ -410,12 +427,10 @@ class CentroidShardedIvfIndexTopoBuilder {
             return new ClosingIterator<>(
                     indexBuilder.assignCentroidVectorsLazy(data, split.rowRanges()),
                     data,
-                    recordReader,
-                    indexBuilder);
+                    recordReader);
         } catch (Throwable t) {
             closeQuietly(data, t);
             closeQuietly(recordReader, t);
-            closeQuietly(indexBuilder, t);
             throw t;
         }
     }
@@ -484,6 +499,83 @@ class CentroidShardedIvfIndexTopoBuilder {
                     centroid,
                     nlist);
             return centroid;
+        }
+    }
+
+    private static class CentroidAssignmentPartitionIterator
+            implements Iterator<Tuple2<Integer, CentroidShardedIvfIndexBuilder.AssignedVector>> {
+
+        private final CentroidShardedIvfIndexBuilder indexBuilder;
+        private final ReadBuilder builder;
+        private final Iterator<byte[]> splitPayloads;
+        private Iterator<Tuple2<Integer, CentroidShardedIvfIndexBuilder.AssignedVector>>
+                assignedVectors = Collections.emptyIterator();
+        private boolean closed;
+
+        private CentroidAssignmentPartitionIterator(
+                CentroidShardedIvfIndexBuilder indexBuilder,
+                ReadBuilder builder,
+                Iterator<byte[]> splitPayloads) {
+            this.indexBuilder = indexBuilder;
+            this.builder = builder;
+            this.splitPayloads = splitPayloads;
+        }
+
+        @Override
+        public boolean hasNext() {
+            try {
+                while (!assignedVectors.hasNext()) {
+                    if (!splitPayloads.hasNext()) {
+                        close();
+                        return false;
+                    }
+
+                    IndexedSplit split = deserializeIndexedSplitPayload(splitPayloads.next());
+                    assignedVectors = assignCentroidVectors(indexBuilder, builder, split);
+                }
+                return true;
+            } catch (RuntimeException | Error e) {
+                closeQuietly(e);
+                throw e;
+            } catch (Exception e) {
+                RuntimeException error =
+                        new RuntimeException("Failed to assign vectors to centroids.", e);
+                closeQuietly(error);
+                throw error;
+            }
+        }
+
+        @Override
+        public Tuple2<Integer, CentroidShardedIvfIndexBuilder.AssignedVector> next() {
+            try {
+                if (!hasNext()) {
+                    throw new NoSuchElementException();
+                }
+                return assignedVectors.next();
+            } catch (RuntimeException | Error e) {
+                closeQuietly(e);
+                throw e;
+            }
+        }
+
+        private void close() {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            try {
+                indexBuilder.close();
+            } catch (Exception e) {
+                throw new RuntimeException("Failed to close centroid assignment builder.", e);
+            }
+        }
+
+        private void closeQuietly(Throwable error) {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            CentroidShardedIvfIndexTopoBuilder.closeQuietly(indexBuilder, error);
         }
     }
 
